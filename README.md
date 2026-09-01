@@ -154,21 +154,52 @@ No GitHub Releases needed — BRAT pulls `main.js` + `manifest.json` directly.
 ### Optional: GitHub Releases for versioned installs
 
 A `.github/workflows/release.yml` Action runs on every push to `main`.
-It reads the new `manifest.json` version, creates the matching `vX.Y.Z`
-tag if it doesn't exist, and publishes a GitHub Release with `main.js`,
-`manifest.json`, and `styles.css` attached. Zero manual steps after the
-push.
+It uses [`standard-version`](https://github.com/conventional-changelog/standard-version)
+to read commit messages, bump the version, generate `CHANGELOG.md`,
+commit the bump, create the matching `vX.Y.Z` tag, push the tag, and
+publish a GitHub Release with `main.js` + `manifest.json` + `styles.css`
+attached. **Zero manual steps after the push.**
 
 **Release flow:**
 
-1. `pwsh .\scripts\release.ps1` — bumps version, builds, commits locally.
-   Single [Y/n] prompt before the push.
+1. You commit your work to `main` with a Conventional Commits prefix
+   (e.g. `feat:`, `fix:`, `chore:`, `BREAKING CHANGE:`).
 2. You push `main` from your IDE.
-3. GH Action picks it up, tags, releases.
+3. The GH Action runs `standard-version`, which auto-detects the
+   bump type from the commits since the last tag.
+4. The Action pushes the resulting `chore(release): vX.Y.Z` commit
+   and the `vX.Y.Z` tag back to `main`, then publishes the GitHub
+   Release.
 
-Manual re-runs of the Action (e.g. for re-publishing a release with
-corrected notes) are supported via the Actions tab → "Run workflow"
-with a custom tag input.
+**Bump types and how to trigger them:**
+
+| Bump | Trigger |
+|---|---|
+| patch | a `fix:` commit |
+| minor | a `feat:` commit |
+| major | a commit with `BREAKING CHANGE:` footer, OR a `feat!:` / `fix!:` prefix |
+
+**Forcing a specific bump type:** when you don't want to write a
+special commit, run the Action manually with the override:
+
+1. Go to <https://github.com/BigHoss/obsidian-inboxprocessor-plugin/actions>
+2. Click **Release** → **Run workflow** → main branch
+3. Set the "releaseAs" dropdown to `patch` / `minor` / `major`
+4. Click green **Run workflow**
+
+The action runs `npx standard-version --release-as <type>` which forces
+that bump regardless of commit messages.
+
+**Pre-1.0 quirk:** for versions `0.x.y`, `standard-version` treats
+`feat:` as **patch** (not minor) because pre-1.0 software is considered
+"anything may change." Use the workflow_dispatch override or craft a
+`BREAKING CHANGE:` commit to force the right bump.
+
+**Note on `v0.4.1`:** the v0.4.1 release was created before the
+`standard-version` flow existed, and the `versions.json` had a stray
+`v0.4.1` entry (with the `v` prefix). The new flow's custom updater
+in `scripts/obsidian-versions-updater.cjs` writes bare semver keys only.
+The next release through the new pipeline cleans this up.
 
 ---
 

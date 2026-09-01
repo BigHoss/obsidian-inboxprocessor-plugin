@@ -1,25 +1,37 @@
 name: Release
 
-# Trigger on push to main: when manifest.json's version has been bumped
-# (typically via scripts/release.ps1), this workflow creates the matching
-# git tag (vX.Y.Z) and a GitHub Release with main.js, manifest.json, and
-# styles.css attached.
+# Trigger on push to main. The workflow:
+#  1. Builds the plugin (npm run build)
+#  2. Runs `npx standard-version` to bump manifest.json / package.json /
+#     versions.json, generate CHANGELOG.md, commit the bump locally,
+#     and create the matching vX.Y.Z tag.
+#  3. Pushes the bump commit and the tag to origin.
+#  4. Publishes a GitHub Release with the three plugin assets attached.
 #
-# No manual tag management required: push main, action does the rest.
+# Conventional Commits drive the bump level:
+#   - BREAKING CHANGE: footer or feat!: / fix!: prefix → major
+#   - feat: → minor
+#   - fix: → patch
+#   - everything else → no bump
 #
-# Manual re-runs are also supported via the Actions tab → "Run workflow"
-# with a custom tag input (used for re-releasing after fixing a bad tag,
-# or publishing a tag from a non-main branch).
+# Override the auto-detected bump type via workflow_dispatch input.
+# Run the workflow from the Actions tab, select "patch / minor / major"
+# from the dropdown, and standard-version is invoked with --release-as.
+#
+# No local tag management required. No local `gh release create` needed.
+# Push main, the action does the rest.
 on:
   push:
     branches:
       - main
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Tag to release (e.g. v0.4.1)"
-        required: true
-        type: string
+      releaseAs:
+        description: "Force a specific bump type. Leave blank to auto-detect from commit messages."
+        required: false
+        type: choice
+        options: [patch, minor, major]
+        default: ""
 
 permissions:
   contents: write
@@ -32,19 +44,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          # Full history so standard-version can see all commits since
+          # the last tag and compute the next semver.
           fetch-depth: 0
-
-      - name: Read manifest version
-        id: version
-        run: |
-          VERSION=$(node -e "console.log(require('./manifest.json').version)")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Manifest version: $VERSION"
+          # Persist credentials so subsequent git push steps work.
+          persist-credentials: true
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # Node 20 is deprecated on GH Actions runners as of 2025-09-19
+          # (https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/).
+          # Pin to 24 to match the current runner default and silence the warning.
+          node-version: "24"
           cache: "npm"
 
       - name: Install
@@ -60,53 +72,55 @@ jobs:
           test -f styles.css || (echo "styles.css missing" && exit 1)
           echo "All three plugin assets present"
 
-      - name: Resolve target tag
-        id: target
+      - name: Bump version with standard-version
+        id: bump
+        env:
+          GIT_AUTHOR_NAME: "github-actions[bot]"
+          GIT_AUTHOR_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"
+          GIT_COMMITTER_NAME: "github-actions[bot]"
+          GIT_COMMITTER_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          if [ -n "${{ inputs.releaseAs }}" ]; then
+            echo "Forcing release type: ${{ inputs.releaseAs }}"
+            npx standard-version --release-as "${{ inputs.releaseAs }}"
           else
-            echo "tag=v${{ steps.version.outputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "Auto-detecting release type from commit messages..."
+            npx standard-version
           fi
-          echo "Target tag: ${{ steps.target.outputs.tag }}"
+          # After standard-version runs, manifest.json has the new version.
+          # Read it for the next steps.
+          NEW_VERSION=$(node -e "console.log(require('./manifest.json').version)")
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Bumped to v$NEW_VERSION"
 
-      - name: Check if tag exists on remote
-        id: tagcheck
+      - name: Push release commit and tag
         run: |
-          # Query the remote directly — local clone may or may not have
-          # the tag depending on fetch behavior. We want to know whether
-          # the *remote* has the tag.
-          if git ls-remote --tags origin "refs/tags/${{ steps.target.outputs.tag }}" | grep -q .; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Tag ${{ steps.target.outputs.tag }} already exists on remote"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "Tag ${{ steps.target.outputs.tag }} does not exist on remote"
-          fi
+          git push origin main
+          git push origin "v${{ steps.bump.outputs.version }}"
+          echo "Pushed release commit and tag v${{ steps.bump.outputs.version }}"
 
-      - name: Create and push tag
-        if: steps.tagcheck.outputs.exists == 'false'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag "${{ steps.target.outputs.tag }}"
-          git push origin "${{ steps.target.outputs.tag }}"
-          echo "Created and pushed ${{ steps.target.outputs.tag }}"
-
-      - name: Create release
+      - name: Create or update release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.target.outputs.tag }}
-          name: "Link Inbox Processor ${{ steps.target.outputs.tag }}"
+          tag_name: v${{ steps.bump.outputs.version }}
+          name: "Link Inbox Processor v${{ steps.bump.outputs.version }}"
           body: |
-            See the [v${{ steps.version.outputs.version }}/Plan.md](https://github.com/${{ github.repository }}/blob/${{ steps.target.outputs.tag }}/v${{ steps.version.outputs.version }}/Plan.md) for the full change list.
+            See the [v${{ steps.bump.outputs.version }}/Plan.md](https://github.com/${{ github.repository }}/blob/v${{ steps.bump.outputs.version }}/v${{ steps.bump.outputs.version }}/Plan.md) for the full change list. If the file does not exist for this version, see [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/v${{ steps.bump.outputs.version }}/CHANGELOG.md) for the auto-generated change list.
 
             ## Install
 
             Use [BRAT](https://github.com/TfTHacker/obsidian42-brat) and add this repo as a beta plugin, or drop `main.js`, `manifest.json`, `styles.css` into `<vault>/.obsidian/plugins/kuster-inbox-processor/`.
           draft: false
           prerelease: false
+          # generate_release_notes appends an auto-generated changelog on
+          # first publish; on subsequent runs of the same tag, it stays
+          # (doesn't duplicate, doesn't clobber — softprops is idempotent
+          # here).
           generate_release_notes: true
+          # overwrite_files_in_existing_release: true ensures re-runs
+          # replace the three assets with the freshly-built ones, so a
+          # bad build never sticks.
+          overwrite_files_in_existing_release: true
           files: |
             main.js
             manifest.json
