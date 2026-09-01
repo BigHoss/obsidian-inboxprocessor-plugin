@@ -151,6 +151,26 @@ The repo is private. To install on every device and auto-update on every
 
 No GitHub Releases needed — BRAT pulls `main.js` + `manifest.json` directly.
 
+### Optional: GitHub Releases for versioned installs
+
+A `.github/workflows/release.yml` Action runs on every `v*` tag push
+and creates a GitHub Release with `main.js` + `manifest.json` + `styles.css`
+attached. Use `scripts/release.ps1` locally to bump the version, build,
+commit, push main, tag, push tag — the Action takes over from the tag
+push and finalises the release. Manual `workflow_dispatch` is also
+supported via the Actions tab (input: tag name).
+
+Release flow:
+
+```powershell
+pwsh .\scripts\release.ps1           # 4 [Y/n] prompts: push, tag, push tag, gh release
+                                    # — except the GH Action does the last step automatically
+                                    # if you push the tag yourself
+```
+
+OR push the tag manually after `release.ps1 -SkipPush` finishes, and the
+Action does the rest.
+
 ---
 
 ## Configuration
@@ -277,6 +297,29 @@ The plugin also fills blank `destination:`, `url:`, and `tags: []` frontmatter l
 ## Architecture choice
 
 Replaces the **Option A: Pure filesystem polling** plan from the vault's `0. Inbox/Research/Inbox Processor Architecture.md` with a plugin that runs **inside Obsidian's process** and reacts to user actions rather than a host cron. No Docker, no cron, no Python container — just a single TypeScript file that ships with the repo.
+
+## Known limitations
+
+### Notebook Navigator (NN) — file right-click
+
+The "Move to archive" and "Convert to project…" right-click commands
+work in Obsidian's default file explorer, but **do not appear in
+Notebook Navigator's right-click menu**. NN replaces Obsidian's file
+tree with its own UI and does not fire the standard
+`workspace.on('file-menu')` event that plugins hook into.
+
+**Workaround:** open the file in an editor, then either:
+
+1. Select text in the editor → right-click → "Create project from
+   selection" (works because the editor-menu event fires)
+2. Use the Command Palette (Ctrl/Cmd+P) → "Move to archive" or
+   "Create project from selection" (works always)
+
+A feature request to Notebook Navigator for a public context-menu
+API is the only proper fix. Until then, NN users get the editor +
+palette paths.
+
+---
 
 ## License
 
