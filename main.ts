@@ -14,8 +14,10 @@
 
 import {
   App,
+  ButtonComponent,
   Editor,
   MarkdownView,
+  Modal,
   Notice,
   Plugin,
   PluginSettingTab,
@@ -559,7 +561,9 @@ export default class KusterInboxPlugin extends Plugin {
     const processedLines: string[] = [];
     const survivors: string[] = [];
     let okCount = 0;
+    let skipCount = 0;
     let failCount = 0;
+    let aborted = false;
     const cap = Math.min(lines.length, this.settings.maxLinksPerRun);
 
     for (let i = 0; i < cap; i++) {
@@ -570,9 +574,21 @@ export default class KusterInboxPlugin extends Plugin {
         continue;
       }
       try {
-        await this.processOne(parsed, templatesByType, defaultTemplate);
-        processedLines.push(line);
-        okCount++;
+        const result = await this.processOne(parsed, templatesByType, defaultTemplate);
+        if (result === null) {
+          // user chose Skip — link stays in inbox for next run
+          survivors.push(line);
+          skipCount++;
+        } else if (typeof result === "object" && "abort" in result) {
+          // user chose Abort — stop the entire batch here
+          for (let j = i; j < cap; j++) survivors.push(lines[j]);
+          for (let j = cap; j < lines.length; j++) survivors.push(lines[j]);
+          aborted = true;
+          break;
+        } else {
+          processedLines.push(line);
+          okCount++;
+        }
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         new Notice(`✗ ${parsed.url} — ${msg}`);
@@ -581,16 +597,18 @@ export default class KusterInboxPlugin extends Plugin {
         await notifyError(this.settings, `Failed: ${parsed.url}\n${msg}`);
       }
     }
-    for (let i = cap; i < lines.length; i++) survivors.push(lines[i]);
+    if (!aborted) {
+      for (let i = cap; i < lines.length; i++) survivors.push(lines[i]);
+    }
 
     const tail = survivors.length > 0 ? "\n" + survivors.join("\n") + "\n" : "\n";
     const updated = head + tail;
     await this.app.vault.modify(file, updated);
 
     new Notice(
-      `Inbox: ${okCount} processed, ${failCount} kept for retry${
-        cap < lines.length ? `, ${lines.length - cap} deferred` : ""
-      }`,
+      `Inbox: ${okCount} processed, ${skipCount} skipped, ${failCount} kept for retry${
+        cap < lines.length && !aborted ? `, ${lines.length - cap} deferred` : ""
+      }${aborted ? " (aborted)" : ""}`,
     );
     this.refreshStatusBar();
   }
@@ -611,8 +629,14 @@ export default class KusterInboxPlugin extends Plugin {
       ? await this.app.vault.read(defaultTemplateFile)
       : DEFAULT_TEMPLATE;
     try {
-      const path = await this.processOne(parsed, templatesByType, defaultTemplate);
-      new Notice(`✓ ${path}`);
+      const result = await this.processOne(parsed, templatesByType, defaultTemplate);
+      if (result === null) {
+        new Notice("Skipped duplicate");
+      } else if (typeof result === "object" && "abort" in result) {
+        new Notice("Aborted");
+      } else {
+        new Notice(`✓ ${result}`);
+      }
       this.refreshStatusBar();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -624,7 +648,7 @@ export default class KusterInboxPlugin extends Plugin {
     parsed: ParsedLine,
     templatesByType: Map<string, string>,
     defaultTemplate: string,
-  ): Promise<string> {
+  ): Promise<string | null | { abort: true }> {
     // 1. Fetch metadata
     const r = await requestUrl({
       url: parsed.url,
@@ -657,10 +681,73 @@ export default class KusterInboxPlugin extends Plugin {
     // 5. Render
     const body = renderNote(template, baseTitle, parsed.url, meta, llm, stamp, destinationDir);
 
-    // 6. Write atomically — vault.create auto-creates parent folders
-    await this.app.vault.create(notePath, body);
+    // 6. Resolve filename collisions against existing files. Obsidian's
+    // vault.create throws "File already exists" if the path is taken; we
+    // want to give the user a real choice instead of failing the batch.
+    const resolution = await this.resolveCollision(notePath, parsed.url);
+    if (resolution.kind === "skip") return null;            // count as skipped, batch continues
+    if (resolution.kind === "abort") return { abort: true }; // stop the entire batch
+    const resolvedPath = resolution.path;
 
-    return notePath;
+    // 7. Write atomically — vault.create auto-creates parent folders
+    await this.app.vault.create(resolvedPath, body);
+
+    return resolvedPath;
+  }
+
+  // Decide what to do when the destination filename already exists.
+  // Pre-checks cheaply with adapter.exists so we don't depend on the throw
+  // from vault.create. If the file appears between our check and the
+  // create call (unlikely but possible), the catch in processInbox still
+  // surfaces it as a per-link failure.
+  private async resolveCollision(
+    notePath: string,
+    sourceUrl: string,
+  ): Promise<
+    | { kind: "write"; path: string }
+    | { kind: "skip" }
+    | { kind: "abort" }
+  > {
+    const exists = await this.app.vault.adapter.exists(notePath);
+    if (!exists) return { kind: "write", path: notePath };
+
+    const choice = await new Promise<DuplicateChoice>((resolve) => {
+      new DuplicateNoteModal(this.app, {
+        notePath,
+        sourceUrl,
+        onChoose: (c) => resolve(c),
+      }).open();
+    });
+
+    if (choice === "skip") {
+      new Notice(`Skipped duplicate: ${notePath}`);
+      return { kind: "skip" };
+    }
+    if (choice === "abort") {
+      new Notice(`Aborted batch at duplicate: ${notePath}`);
+      return { kind: "abort" };
+    }
+    if (choice === "overwrite") {
+      // Delete the existing file first; vault.create refuses to overwrite.
+      const existing = this.app.vault.getAbstractFileByPath(notePath);
+      if (existing instanceof TFile) {
+        await this.app.vault.delete(existing);
+      }
+      return { kind: "write", path: notePath };
+    }
+    // rename: append -2, -3, ... until a free name is found
+    const dir = notePath.includes("/") ? notePath.slice(0, notePath.lastIndexOf("/")) : "";
+    const ext = ".md";
+    const stem = notePath.slice(dir.length + 1, -ext.length);
+    for (let n = 2; n < 1000; n++) {
+      const candidate = `${dir}/${stem} - ${n}${ext}`;
+      if (!(await this.app.vault.adapter.exists(candidate))) {
+        new Notice(`Renamed to: ${candidate}`);
+        return { kind: "write", path: candidate };
+      }
+    }
+    // Pathological — give up and let create throw
+    return { kind: "write", path: notePath };
   }
 
   // Generate the default template body for a slot and write it to
@@ -1085,6 +1172,101 @@ class KusterInboxSettingTab extends PluginSettingTab {
             await this.plugin.saveData(this.plugin.settings);
           }),
       );
+  }
+}
+
+// ============================================================================
+// Duplicate-resolution modal
+// ============================================================================
+
+type DuplicateChoice = "skip" | "rename" | "overwrite" | "abort";
+
+// Shown when the destination filename already exists. Returns the user's
+// choice via a promise so the caller can `await` it before continuing.
+class DuplicateNoteModal extends Modal {
+  private notePath: string;
+  private sourceUrl: string;
+  private onChoose: (choice: DuplicateChoice) => void;
+
+  constructor(
+    app: App,
+    opts: { notePath: string; sourceUrl: string; onChoose: (c: DuplicateChoice) => void },
+  ) {
+    super(app);
+    this.notePath = opts.notePath;
+    this.sourceUrl = opts.sourceUrl;
+    this.onChoose = opts.onChoose;
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+
+    contentEl.createEl("h2", { text: "Note already exists" });
+
+    contentEl.createEl("p", {
+      text: "A note with this filename already exists in the destination folder.",
+    });
+
+    contentEl.createEl("p", { cls: "kip-conflict-path", text: this.notePath }).style.cssText =
+      "font-family: var(--font-monospace); font-size: 12px; padding: 6px 8px; background: var(--background-secondary); border-radius: 4px; word-break: break-all;";
+
+    const urlEl = contentEl.createEl("p");
+    urlEl.createEl("span", { text: "Source: ", cls: "kip-conflict-label" });
+    urlEl.createEl("span", { text: this.sourceUrl, attr: { style: "word-break: break-all;" } });
+
+    const buttonRow = contentEl.createDiv({ cls: "kip-conflict-buttons" });
+    buttonRow.style.cssText =
+      "display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; flex-wrap: wrap;";
+
+    const closeWith = (choice: DuplicateChoice) => () => {
+      this.close();
+      this.onChoose(choice);
+    };
+
+    // Order matters: most conservative on the left.
+    new ButtonComponent(buttonRow)
+      .setButtonText("Skip")
+      .setTooltip("Keep the existing file. This link stays in the inbox for next time.")
+      .onClick(closeWith("skip"));
+
+    new ButtonComponent(buttonRow)
+      .setButtonText("Rename (-2)")
+      .setTooltip("Save with an incremented suffix, e.g. '... - 2.md'.")
+      .onClick(closeWith("rename"));
+
+    new ButtonComponent(buttonRow)
+      .setButtonText("Overwrite")
+      .setWarning()
+      .setTooltip("Delete the existing file and write the new one in its place. Destructive — cannot be undone.")
+      .onClick(closeWith("overwrite"));
+
+    new ButtonComponent(buttonRow)
+      .setButtonText("Abort batch")
+      .setWarning()
+      .setTooltip("Stop processing the rest of this batch. Already-processed links are kept.")
+      .onClick(closeWith("abort"));
+
+    // Keyboard shortcuts — Enter = Rename (the safe default)
+    contentEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        closeWith("rename")();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        closeWith("skip")();
+      }
+    });
+    // Focus the modal so keyboard works immediately
+    setTimeout(() => {
+      const btn = buttonRow.querySelector("button");
+      btn?.focus();
+    }, 0);
+  }
+
+  onClose(): void {
+    const { contentEl } = this;
+    contentEl.empty();
   }
 }
 
