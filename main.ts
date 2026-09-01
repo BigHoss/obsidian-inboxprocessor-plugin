@@ -28,17 +28,35 @@ import {
 // Settings
 // ============================================================================
 
+// One entry per "link-type". The LLM classifies each URL into one of these
+// (by `linkType` value), and the plugin picks the matching template at render
+// time. Defaults cover the three PARA subfolders in the inbox; users add
+// more rows for custom types.
+interface TemplateSlot {
+  linkType: string;            // e.g. "link", "media", "task", "shopping"
+  templatePath: string;        // vault-relative path to the .md template
+  hint: string;                // sent to the LLM so it can classify correctly
+  defaultDestination: string;  // folder the rendered note lands in, e.g. "0. Inbox/Links"
+}
+
 interface KusterInboxSettings {
   inboxFile: string;
-  linksDir: string;
-  templateFile: string;
   shareMarker: string;
+  templates: TemplateSlot[];
+  defaultTemplatePath: string; // fallback when LLM returns an unknown linkType
   // OpenRouter (https://openrouter.ai) — single endpoint, model-agnostic.
   openrouterApiKey: string;
   openrouterModel: string;
   openrouterReferer: string;
   openrouterAppName: string;
   llmEnabled: boolean;
+  // Optional CLAUDE.md inside the inbox — passed to the LLM as system context
+  // so it knows your conventions. Created/seeded from settings; never
+  // overwritten if it already exists.
+  claudeContextPath: string;
+  // Allowed root for LLM-suggested destinations. Anything outside fails closed
+  // to the per-template defaultDestination. Paths are vault-relative.
+  allowedDestinationRoots: string[];
   fetchTimeoutSeconds: number;
   maxLinksPerRun: number;
   notifyOnError: boolean;
@@ -48,14 +66,41 @@ interface KusterInboxSettings {
 
 const DEFAULT_SETTINGS: KusterInboxSettings = {
   inboxFile: "0. Inbox/0. Inbox.md",
-  linksDir: "0. Inbox/Links",
-  templateFile: "5. System/Templates/Inbox/Link Template.md",
   shareMarker: "<!-- New iOS-shared links should land BELOW this comment -->",
+  templates: [
+    {
+      linkType: "link",
+      templatePath: "5. System/Templates/Inbox/Link Template.md",
+      hint: "Web articles, tools, tutorials, repos, blog posts — anything read-once.",
+      defaultDestination: "0. Inbox/Links",
+    },
+    {
+      linkType: "media",
+      templatePath: "5. System/Templates/Inbox/Media Template.md",
+      hint: "Movies, TV shows, books, games, podcasts, albums — anything to watch/read/play later.",
+      defaultDestination: "0. Inbox/Media",
+    },
+    {
+      linkType: "task",
+      templatePath: "5. System/Templates/Inbox/Task Template.md",
+      hint: "Action items, to-dos, things to fix or set up — anything that needs doing.",
+      defaultDestination: "0. Inbox/Tasks",
+    },
+  ],
+  defaultTemplatePath: "5. System/Templates/Inbox/Link Template.md",
   openrouterApiKey: "",
-  openrouterModel: "openai/gpt-5-mini",
-  openrouterReferer: "",
+  openrouterModel: "openrouter/auto-beta",
+  openrouterReferer: "https://github.com/BigHoss/obsidian-inboxprocessor-plugin",
   openrouterAppName: "Kuster Inbox Processor",
   llmEnabled: false,
+  claudeContextPath: "0. Inbox/CLAUDE.md",
+  allowedDestinationRoots: [
+    "0. Inbox",
+    "1. Projects",
+    "2. Areas",
+    "3. Resources",
+    "4. Archive",
+  ],
   fetchTimeoutSeconds: 10,
   maxLinksPerRun: 50,
   notifyOnError: false,
@@ -84,6 +129,37 @@ interface LlmEnrichment {
   refinedTitle: string;
   suggestedDestination: string;
   suggestedTags: string[];
+  linkType: string; // one of the configured TemplateSlot.linkType values
+}
+
+// Read the CLAUDE.md context file if it exists. Returns empty string if not
+// found or unreadable. Never throws — the plugin must keep working even if
+// the user hasn't created the file yet.
+async function readClaudeContext(
+  app: App,
+  path: string,
+): Promise<string> {
+  const f = app.vault.getAbstractFileByPath(path);
+  if (!(f instanceof TFile)) return "";
+  try {
+    return await app.vault.cachedRead(f);
+  } catch {
+    return "";
+  }
+}
+
+// Returns true if `dest` starts with one of the allowed roots. Fails closed.
+function isDestinationAllowed(
+  dest: string,
+  allowedRoots: string[],
+): boolean {
+  if (!dest) return false;
+  // Normalize: strip leading "./" or "/", no trailing slash
+  const norm = dest.replace(/^\.?\//, "").replace(/\/+$/, "");
+  return allowedRoots.some((root) => {
+    const r = root.replace(/\/+$/, "");
+    return norm === r || norm.startsWith(r + "/");
+  });
 }
 
 // ============================================================================
@@ -196,39 +272,61 @@ function extractMeta(html: string): FetchedMeta {
 // ============================================================================
 
 async function enrichWithLlm(
+  app: App,
   settings: KusterInboxSettings,
   url: string,
   meta: FetchedMeta,
 ): Promise<LlmEnrichment | null> {
   if (!settings.llmEnabled || !settings.openrouterApiKey) return null;
-  const prompt = `Given this URL and its open-graph metadata, return a JSON object with refinedTitle (3-7 words, Title Case), suggestedDestination ("0. Inbox/Links" or "3. Resources" or "1. Projects"), and suggestedTags (array of 2-5 lower-case tags).
 
-URL: ${url}
-og:title: ${meta.title}
-og:description: ${meta.description}
-og:site_name: ${meta.siteName}
+  // Build the catalogue of linkTypes + allowed destination roots so the LLM
+  // is constrained to safe choices.
+  const typeList = settings.templates
+    .map((t) => `- "${t.linkType}": ${t.hint} (default: ${t.defaultDestination})`)
+    .join("\n");
+  const allowed = settings.allowedDestinationRoots.join(", ");
 
-Return ONLY a JSON object, no prose, no code fences.`;
+  const claudeContext = await readClaudeContext(app, settings.claudeContextPath);
+
+  const systemPrompt =
+    `You classify URLs for an Obsidian PARA vault. The vault has these PARA folders:\n` +
+    `0. Inbox (capture zone), 1. Projects (active outcomes), 2. Areas (ongoing responsibilities),\n` +
+    `3. Resources (reference material), 4. Archive (completed/dormant). Within 0. Inbox there are\n` +
+    `subfolders: Links/, Media/, Tasks/, Research/, Reference/, Decision Records/, Handoffs/, Dailies/.\n\n` +
+    `Allowed destination roots: ${allowed}.\n` +
+    `Never return a destination outside these roots — if uncertain, return one of the link-type defaults.\n\n` +
+    `Available link-types:\n${typeList}\n\n` +
+    (claudeContext
+      ? `## User's classification context (from 0. Inbox/CLAUDE.md)\n\n${claudeContext}\n\n`
+      : "") +
+    `Return ONLY a JSON object with these fields:\n` +
+    `- refinedTitle: 3-7 words, Title Case, human-readable\n` +
+    `- linkType: one of the link-type strings above (e.g. "link", "media", "task")\n` +
+    `- suggestedDestination: vault-relative path under one of the allowed roots, e.g. "3. Resources/AI" or "0. Inbox/Tasks"\n` +
+    `- suggestedTags: array of 2-5 lower-case tags\n\n` +
+    `No prose, no code fences.`;
+
+  const userPrompt =
+    `URL: ${url}\nog:title: ${meta.title}\nog:description: ${meta.description}\nog:site_name: ${meta.siteName}`;
+
   try {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${settings.openrouterApiKey}`,
     };
-    // OpenRouter ranks apps by referer + title; setting both is recommended
-    // for free-tier rate limits and analytics. Both optional but useful.
-    if (settings.openrouterReferer) {
-      headers["HTTP-Referer"] = settings.openrouterReferer;
-    }
-    if (settings.openrouterAppName) {
-      headers["X-Title"] = settings.openrouterAppName;
-    }
+    if (settings.openrouterReferer) headers["HTTP-Referer"] = settings.openrouterReferer;
+    if (settings.openrouterAppName) headers["X-Title"] = settings.openrouterAppName;
+
     const body: RequestUrlParam = {
       url: "https://openrouter.ai/api/v1/chat/completions",
       method: "POST",
       headers,
       body: JSON.stringify({
         model: settings.openrouterModel,
-        messages: [{ role: "user", content: prompt }],
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
         temperature: 0.2,
       }),
       throw: false,
@@ -239,14 +337,29 @@ Return ONLY a JSON object, no prose, no code fences.`;
     const json = text.match(/\{[\s\S]*\}/)?.[0];
     if (!json) return null;
     const parsed = JSON.parse(json);
+
+    // Resolve linkType against configured slots
+    const requestedType = String(parsed.linkType ?? "").trim();
+    const slot =
+      settings.templates.find((t) => t.linkType === requestedType) ??
+      settings.templates[0];
+
+    // Validate destination — if LLM gave something unsafe, fall back to the
+    // slot's defaultDestination.
+    const requestedDest = String(parsed.suggestedDestination ?? "").trim();
+    const safeDest = isDestinationAllowed(requestedDest, settings.allowedDestinationRoots)
+      ? requestedDest
+      : slot.defaultDestination;
+
     return {
       refinedTitle: String(parsed.refinedTitle ?? meta.title ?? "Untitled").trim(),
-      suggestedDestination: String(
-        parsed.suggestedDestination ?? settings.linksDir,
-      ).trim(),
+      suggestedDestination: safeDest,
       suggestedTags: Array.isArray(parsed.suggestedTags)
-        ? parsed.suggestedTags.map((t: unknown) => String(t).toLowerCase().trim()).filter(Boolean)
+        ? parsed.suggestedTags
+            .map((t: unknown) => String(t).toLowerCase().trim())
+            .filter(Boolean)
         : [],
+      linkType: slot.linkType,
     };
   } catch {
     return null;
@@ -264,35 +377,47 @@ function renderNote(
   meta: FetchedMeta,
   llm: LlmEnrichment | null,
   stamp: string,
+  destination: string,
 ): string {
   const finalTitle = llm?.refinedTitle ?? meta.title ?? title ?? "Untitled Link";
-  const destination = llm?.suggestedDestination ?? "0. Inbox/Links";
   const tags = llm?.suggestedTags ?? [];
-  const created = new Date()
-    .toISOString()
-    .replace("T", " ")
-    .replace(/\..+$/, "");
 
-  const out = template
-    .replace(/\{\{date:YYYYMMDDHHmmss\}\}/g, stamp)
-    .replace(/\{\{date:YYYY-MM-DD HH:mm\}\}/g, created)
+  // Build all the {{date:...}} placeholders the templates use.
+  // - {{date:YYYYMMDDHHmmss}}        → compact stamp for filenames + frontmatter
+  // - {{date:YYYY-MM-DD HH:mm}}      → human-readable (replaces "T" with " ")
+  // - {{date:YYYY-MM-DDTHH:mm}}      → ISO style used by existing templates
+  // - {{date:YYYY-MM-DD}}            → date-only
+  // - {{date}}                       → full ISO
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const compactStamp = stamp;
+  const dateDashTime = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const isoLike = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const dateOnly = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+
+  let out = template
+    .replace(/\{\{date:YYYYMMDDHHmmss\}\}/g, compactStamp)
+    .replace(/\{\{date:YYYY-MM-DD HH:mm\}\}/g, dateDashTime)
+    .replace(/\{\{date:YYYY-MM-DDTHH:mm\}\}/g, isoLike)
+    .replace(/\{\{date:YYYY-MM-DD\}\}/g, dateOnly)
     .replace(/\{\{title\}\}/g, finalTitle);
 
-  // If template has placeholders for url/tags/destination that look like blank
-  // values, fill them in. Otherwise prepend a small metadata block so the
-  // produced note is never ambiguous.
-  let body = out;
-  const urlLineRe = /^(\s*-?\s*URL:\s*)$/m;
-  if (urlLineRe.test(body)) {
-    body = body.replace(urlLineRe, `$1 ${url}`);
-  } else {
-    body = `URL: ${url}\n\n` + body;
+  // Fill in blank `destination:`, `url:`, and `tags: []` lines if the
+  // template uses them. Otherwise prepend a small metadata block.
+  if (/^destination:\s*$/m.test(out)) {
+    out = out.replace(/^destination:\s*$/m, `destination: "${destination}"`);
   }
-  // Set destination frontmatter field if template uses it
-  body = body.replace(/^destination:\s*$/m, `destination: "${destination}"`);
-  // Tags frontmatter
-  body = body.replace(/^tags:\s*\[\]\s*$/m, `tags: [${tags.join(", ")}]`);
-  return body;
+  if (/^url:\s*$/m.test(out)) {
+    out = out.replace(/^url:\s*$/m, `url: ${url}`);
+  }
+  if (/^tags:\s*\[\]\s*$/m.test(out)) {
+    out = out.replace(/^tags:\s*\[\]\s*$/m, `tags: [${tags.join(", ")}]`);
+  }
+  // Also fill a `URL: ` blank line in the body if template uses it
+  if (/^(\s*-\s*)?URL:\s*$/m.test(out)) {
+    out = out.replace(/^(\s*-\s*)?URL:\s*$/m, `$1URL: ${url}`);
+  }
+  return out;
 }
 
 // ============================================================================
@@ -419,17 +544,16 @@ export default class KusterInboxPlugin extends Plugin {
       return;
     }
 
-    const templateFile = this.resolveFile(this.settings.templateFile);
-    const template = templateFile
-      ? await this.app.vault.read(templateFile)
-      : DEFAULT_TEMPLATE;
-
-    // Ensure links dir exists
-    const adapter = this.app.vault.adapter;
-    const linksDir = this.settings.linksDir;
-    if (!(await adapter.exists(linksDir))) {
-      await adapter.mkdir(linksDir);
+    // Pre-load all configured templates
+    const templatesByType = new Map<string, string>();
+    for (const slot of this.settings.templates) {
+      const tf = this.resolveFile(slot.templatePath);
+      if (tf) templatesByType.set(slot.linkType, await this.app.vault.read(tf));
     }
+    const defaultTemplateFile = this.resolveFile(this.settings.defaultTemplatePath);
+    const defaultTemplate = defaultTemplateFile
+      ? await this.app.vault.read(defaultTemplateFile)
+      : DEFAULT_TEMPLATE;
 
     const processedLines: string[] = [];
     const survivors: string[] = [];
@@ -441,12 +565,11 @@ export default class KusterInboxPlugin extends Plugin {
       const line = lines[i];
       const parsed = parseLine(line);
       if (!parsed) {
-        // Non-link lines are kept as survivors (e.g. blank-line markers).
         survivors.push(line);
         continue;
       }
       try {
-        await this.processOne(parsed, template);
+        await this.processOne(parsed, templatesByType, defaultTemplate);
         processedLines.push(line);
         okCount++;
       } catch (e) {
@@ -454,17 +577,11 @@ export default class KusterInboxPlugin extends Plugin {
         new Notice(`✗ ${parsed.url} — ${msg}`);
         survivors.push(line);
         failCount++;
-        await notifyError(
-          this.settings,
-          `Failed: ${parsed.url}\n${msg}`,
-        );
+        await notifyError(this.settings, `Failed: ${parsed.url}\n${msg}`);
       }
     }
-    // Lines beyond cap are kept as survivors for next run
     for (let i = cap; i < lines.length; i++) survivors.push(lines[i]);
 
-    // Atomic rewrite: keep everything up to and including the marker, then
-    // re-emit only the survivors (with a single trailing newline).
     const tail = survivors.length > 0 ? "\n" + survivors.join("\n") + "\n" : "\n";
     const updated = head + tail;
     await this.app.vault.modify(file, updated);
@@ -483,16 +600,17 @@ export default class KusterInboxPlugin extends Plugin {
       new Notice("Current line is not a recognized link");
       return;
     }
-    const templateFile = this.resolveFile(this.settings.templateFile);
-    const template = templateFile
-      ? await this.app.vault.read(templateFile)
-      : DEFAULT_TEMPLATE;
-    const adapter = this.app.vault.adapter;
-    if (!(await adapter.exists(this.settings.linksDir))) {
-      await adapter.mkdir(this.settings.linksDir);
+    const templatesByType = new Map<string, string>();
+    for (const slot of this.settings.templates) {
+      const tf = this.resolveFile(slot.templatePath);
+      if (tf) templatesByType.set(slot.linkType, await this.app.vault.read(tf));
     }
+    const defaultTemplateFile = this.resolveFile(this.settings.defaultTemplatePath);
+    const defaultTemplate = defaultTemplateFile
+      ? await this.app.vault.read(defaultTemplateFile)
+      : DEFAULT_TEMPLATE;
     try {
-      const path = await this.processOne(parsed, template);
+      const path = await this.processOne(parsed, templatesByType, defaultTemplate);
       new Notice(`✓ ${path}`);
       this.refreshStatusBar();
     } catch (e) {
@@ -503,7 +621,8 @@ export default class KusterInboxPlugin extends Plugin {
 
   private async processOne(
     parsed: ParsedLine,
-    template: string,
+    templatesByType: Map<string, string>,
+    defaultTemplate: string,
   ): Promise<string> {
     // 1. Fetch metadata
     const r = await requestUrl({
@@ -517,26 +636,44 @@ export default class KusterInboxPlugin extends Plugin {
     }
     const meta = extractMeta(r.text);
 
-    // 2. Optional LLM enrichment
-    const llm = await enrichWithLlm(this.settings, parsed.url, meta);
+    // 2. Optional LLM enrichment (now classifies linkType + validates destination)
+    const llm = await enrichWithLlm(this.app, this.settings, parsed.url, meta);
 
-    // 3. Compose title + filename
-    const baseTitle =
-      parsed.title ?? meta.title ?? parsed.url;
-    const finalTitle = sanitizeFilename(
-      llm?.refinedTitle ?? baseTitle,
-    );
+    // 3. Pick template + destination
+    const slot =
+      this.settings.templates.find((t) => t.linkType === (llm?.linkType ?? "")) ??
+      this.settings.templates[0];
+    const template = templatesByType.get(slot.linkType) ?? defaultTemplate;
+    const destinationDir = (llm?.suggestedDestination || slot.defaultDestination).trim();
+
+    // 4. Compose title + filename
+    const baseTitle = parsed.title ?? meta.title ?? parsed.url;
+    const finalTitle = sanitizeFilename(llm?.refinedTitle ?? baseTitle);
     const stamp = nowStamp();
     const filename = `${stamp} - ${finalTitle || "Untitled Link"}.md`;
-    const notePath = `${this.settings.linksDir}/${filename}`;
+    const notePath = `${destinationDir}/${filename}`;
 
-    // 4. Render
-    const body = renderNote(template, baseTitle, parsed.url, meta, llm, stamp);
+    // 5. Render
+    const body = renderNote(template, baseTitle, parsed.url, meta, llm, stamp, destinationDir);
 
-    // 5. Write atomically: adapter.write + create is already safe in Obsidian
+    // 6. Write atomically — vault.create auto-creates parent folders
     await this.app.vault.create(notePath, body);
 
     return notePath;
+  }
+
+  // Generate the default template body for a slot and write it to
+  // `slot.templatePath` if no file exists there yet. Never overwrites.
+  async generateTemplate(slot: TemplateSlot): Promise<void> {
+    const existing = this.app.vault.getAbstractFileByPath(slot.templatePath);
+    if (existing instanceof TFile) return;
+    const parent = slot.templatePath.split("/").slice(0, -1).join("/");
+    if (parent && !(await this.app.vault.adapter.exists(parent))) {
+      await this.app.vault.adapter.mkdir(parent);
+    }
+    const body =
+      DEFAULT_TEMPLATES[slot.linkType] ?? DEFAULT_TEMPLATES["custom"];
+    await this.app.vault.create(slot.templatePath, body);
   }
 }
 
@@ -593,6 +730,9 @@ class KusterInboxSettingTab extends PluginSettingTab {
     containerEl.empty();
     containerEl.createEl("h2", { text: "Kuster Inbox Processor" });
 
+    // ---------------------------------------------------------------------
+    // Vault paths
+    // ---------------------------------------------------------------------
     containerEl.createEl("h3", { text: "Vault paths" });
     new Setting(containerEl)
       .setName("Inbox file")
@@ -606,24 +746,13 @@ class KusterInboxSettingTab extends PluginSettingTab {
           }),
       );
     new Setting(containerEl)
-      .setName("Links directory")
-      .setDesc("Folder inside the vault where processed link notes are written.")
+      .setName("Default template path")
+      .setDesc("Used when a link's classified type has no template registered.")
       .addText((t) =>
         t
-          .setValue(this.plugin.settings.linksDir)
+          .setValue(this.plugin.settings.defaultTemplatePath)
           .onChange(async (v) => {
-            this.plugin.settings.linksDir = v.trim();
-            await this.plugin.saveData(this.plugin.settings);
-          }),
-      );
-    new Setting(containerEl)
-      .setName("Template file")
-      .setDesc("Markdown template (with frontmatter placeholders) used for each note.")
-      .addText((t) =>
-        t
-          .setValue(this.plugin.settings.templateFile)
-          .onChange(async (v) => {
-            this.plugin.settings.templateFile = v.trim();
+            this.plugin.settings.defaultTemplatePath = v.trim();
             await this.plugin.saveData(this.plugin.settings);
           }),
       );
@@ -639,6 +768,229 @@ class KusterInboxSettingTab extends PluginSettingTab {
           }),
       );
 
+    // ---------------------------------------------------------------------
+    // Templates (one row per link-type)
+    // ---------------------------------------------------------------------
+    containerEl.createEl("h3", { text: "Templates (one per link-type)" });
+    containerEl.createEl("p", {
+      text:
+        "Each link is classified into one of these types by the LLM. The matching template is rendered. " +
+        "Add rows for custom types (e.g. 'shopping', 'paper', 'video').",
+      cls: "setting-item-description",
+    });
+
+    const renderTemplateRows = () => {
+      const wrapId = "kip-template-rows";
+      const existing = containerEl.querySelector(`#${wrapId}`);
+      if (existing) existing.remove();
+      const wrap = containerEl.createDiv({ attr: { id: wrapId } });
+      this.plugin.settings.templates.forEach((slot, idx) => {
+        const row = wrap.createDiv({ cls: "kip-template-row" });
+        const linkTypeSetting = new Setting(row)
+          .setName(`Type #${idx + 1}: linkType`)
+          .addText((t) =>
+            t
+              .setPlaceholder("link")
+              .setValue(slot.linkType)
+              .onChange(async (v) => {
+                this.plugin.settings.templates[idx].linkType = v.trim();
+                await this.plugin.saveData(this.plugin.settings);
+              }),
+          );
+        new Setting(row)
+          .setName("Hint (sent to the LLM)")
+          .addText((t) =>
+            t
+              .setPlaceholder("Web articles, tools, tutorials, repos, blog posts")
+              .setValue(slot.hint)
+              .onChange(async (v) => {
+                this.plugin.settings.templates[idx].hint = v;
+                await this.plugin.saveData(this.plugin.settings);
+              }),
+          );
+        new Setting(row)
+          .setName("Template path")
+          .addText((t) =>
+            t
+              .setPlaceholder("5. System/Templates/Inbox/My Template.md")
+              .setValue(slot.templatePath)
+              .onChange(async (v) => {
+                this.plugin.settings.templates[idx].templatePath = v.trim();
+                await this.plugin.saveData(this.plugin.settings);
+              }),
+          );
+        new Setting(row)
+          .setName("Default destination")
+          .addText((t) =>
+            t
+              .setPlaceholder("0. Inbox/Links")
+              .setValue(slot.defaultDestination)
+              .onChange(async (v) => {
+                this.plugin.settings.templates[idx].defaultDestination = v.trim();
+                await this.plugin.saveData(this.plugin.settings);
+              }),
+          );
+        const actions = new Setting(row);
+        actions.addButton((b) =>
+          b
+            .setButtonText("Generate default template")
+            .setWarning()
+            .onClick(async () => {
+              await this.plugin.generateTemplate(slot);
+              new Notice(`Template written to ${slot.templatePath}`);
+            }),
+        );
+        actions.addButton((b) =>
+          b
+            .setButtonText("Remove")
+            .setWarning()
+            .onClick(async () => {
+              this.plugin.settings.templates.splice(idx, 1);
+              await this.plugin.saveData(this.plugin.settings);
+              renderTemplateRows();
+            }),
+        );
+      });
+      const addRow = new Setting(wrap)
+        .addButton((b) =>
+          b
+            .setButtonText("+ Add link-type")
+            .onClick(async () => {
+              this.plugin.settings.templates.push({
+                linkType: "custom",
+                templatePath: "5. System/Templates/Inbox/Custom Template.md",
+                hint: "Describe what this type is for.",
+                defaultDestination: "0. Inbox/Links",
+              });
+              await this.plugin.saveData(this.plugin.settings);
+              renderTemplateRows();
+            }),
+        );
+      void linkTypeSetting; // (silence unused-var; Setting needs to be constructed)
+    };
+    renderTemplateRows();
+
+    // ---------------------------------------------------------------------
+    // CLAUDE.md context (read by the LLM as system context)
+    // ---------------------------------------------------------------------
+    containerEl.createEl("h3", { text: "Classification context (CLAUDE.md)" });
+    new Setting(containerEl)
+      .setName("Path")
+      .setDesc("Vault-relative path to the CLAUDE.md the LLM reads as system context.")
+      .addText((t) =>
+        t
+          .setValue(this.plugin.settings.claudeContextPath)
+          .onChange(async (v) => {
+            this.plugin.settings.claudeContextPath = v.trim();
+            await this.plugin.saveData(this.plugin.settings);
+          }),
+      );
+    new Setting(containerEl)
+      .setName("Allowed destination roots")
+      .setDesc(
+        "Comma-separated. The LLM may only suggest destinations under these roots — anything else falls back to the link-type default.",
+      )
+      .addText((t) =>
+        t
+          .setValue(this.plugin.settings.allowedDestinationRoots.join(", "))
+          .onChange(async (v) => {
+            this.plugin.settings.allowedDestinationRoots = v
+              .split(",")
+              .map((s) => s.trim())
+              .filter(Boolean);
+            await this.plugin.saveData(this.plugin.settings);
+          }),
+      );
+    new Setting(containerEl)
+      .setName("Seed CLAUDE.md (only if file is missing)")
+      .setDesc(
+        "Drops a starter file that lists your PARA conventions and link-type catalogue. Never overwrites an existing file.",
+      )
+      .addButton((b) =>
+        b
+          .setButtonText("Create if missing")
+          .onClick(async () => {
+            const path = this.plugin.settings.claudeContextPath;
+            const f = this.plugin.app.vault.getAbstractFileByPath(path);
+            if (f instanceof TFile) {
+              new Notice(`Already exists: ${path}`);
+              return;
+            }
+            const parent = path.split("/").slice(0, -1).join("/");
+            if (parent && !(await this.plugin.app.vault.adapter.exists(parent))) {
+              await this.plugin.app.vault.adapter.mkdir(parent);
+            }
+            await this.plugin.app.vault.create(path, seedClaudeContext());
+            new Notice(`Created ${path}`);
+          }),
+      );
+
+    // ---------------------------------------------------------------------
+    // OpenRouter LLM
+    // ---------------------------------------------------------------------
+    containerEl.createEl("h3", { text: "OpenRouter LLM enrichment" });
+    new Setting(containerEl)
+      .setName("Enable LLM enrichment")
+      .setDesc("Call OpenRouter to classify links, refine titles, suggest destinations, suggest tags.")
+      .addToggle((tg) =>
+        tg
+          .setValue(this.plugin.settings.llmEnabled)
+          .onChange(async (v) => {
+            this.plugin.settings.llmEnabled = v;
+            await this.plugin.saveData(this.plugin.settings);
+          }),
+      );
+    new Setting(containerEl)
+      .setName("OpenRouter API key")
+      .setDesc("Get one at https://openrouter.ai/keys")
+      .addText((t) => {
+        t.inputEl.type = "password";
+        t.setPlaceholder("sk-or-...")
+          .setValue(this.plugin.settings.openrouterApiKey)
+          .onChange(async (v) => {
+            this.plugin.settings.openrouterApiKey = v.trim();
+            await this.plugin.saveData(this.plugin.settings);
+          });
+      });
+    new Setting(containerEl)
+      .setName("OpenRouter model")
+      .setDesc("Default: openrouter/auto-beta (cheapest routing). Set any model from https://openrouter.ai/models")
+      .addText((t) =>
+        t
+          .setPlaceholder("openrouter/auto-beta")
+          .setValue(this.plugin.settings.openrouterModel)
+          .onChange(async (v) => {
+            this.plugin.settings.openrouterModel = v.trim();
+            await this.plugin.saveData(this.plugin.settings);
+          }),
+      );
+    new Setting(containerEl)
+      .setName("HTTP-Referer (optional)")
+      .setDesc("Recommended by OpenRouter for free-tier rate limits.")
+      .addText((t) =>
+        t
+          .setPlaceholder("https://github.com/BigHoss/obsidian-inboxprocessor-plugin")
+          .setValue(this.plugin.settings.openrouterReferer)
+          .onChange(async (v) => {
+            this.plugin.settings.openrouterReferer = v.trim();
+            await this.plugin.saveData(this.plugin.settings);
+          }),
+      );
+    new Setting(containerEl)
+      .setName("X-Title (optional)")
+      .setDesc("App name shown on openrouter.ai rankings.")
+      .addText((t) =>
+        t
+          .setValue(this.plugin.settings.openrouterAppName)
+          .onChange(async (v) => {
+            this.plugin.settings.openrouterAppName = v.trim();
+            await this.plugin.saveData(this.plugin.settings);
+          }),
+      );
+
+    // ---------------------------------------------------------------------
+    // Behavior
+    // ---------------------------------------------------------------------
     containerEl.createEl("h3", { text: "Behavior" });
     new Setting(containerEl)
       .setName("Max links per run")
@@ -666,66 +1018,9 @@ class KusterInboxSettingTab extends PluginSettingTab {
           }),
       );
 
-    containerEl.createEl("h3", { text: "OpenRouter LLM enrichment" });
-    new Setting(containerEl)
-      .setName("Enable LLM enrichment")
-      .setDesc("Call OpenRouter to refine titles, suggest destinations, suggest tags.")
-      .addToggle((tg) =>
-        tg
-          .setValue(this.plugin.settings.llmEnabled)
-          .onChange(async (v) => {
-            this.plugin.settings.llmEnabled = v;
-            await this.plugin.saveData(this.plugin.settings);
-          }),
-      );
-    new Setting(containerEl)
-      .setName("OpenRouter API key")
-      .setDesc("Get one at https://openrouter.ai/keys")
-      .addText((t) => {
-        t.inputEl.type = "password";
-        t.setPlaceholder("sk-or-...")
-          .setValue(this.plugin.settings.openrouterApiKey)
-          .onChange(async (v) => {
-            this.plugin.settings.openrouterApiKey = v.trim();
-            await this.plugin.saveData(this.plugin.settings);
-          });
-      });
-    new Setting(containerEl)
-      .setName("OpenRouter model")
-      .setDesc("Any chat model on https://openrouter.ai/models. Default: openai/gpt-5-mini")
-      .addText((t) =>
-        t
-          .setPlaceholder("openai/gpt-5-mini")
-          .setValue(this.plugin.settings.openrouterModel)
-          .onChange(async (v) => {
-            this.plugin.settings.openrouterModel = v.trim();
-            await this.plugin.saveData(this.plugin.settings);
-          }),
-      );
-    new Setting(containerEl)
-      .setName("HTTP-Referer (optional)")
-      .setDesc("Your app URL — recommended by OpenRouter for free-tier rate limits.")
-      .addText((t) =>
-        t
-          .setPlaceholder("https://github.com/BigHoss/obsidian-inboxprocessor-plugin")
-          .setValue(this.plugin.settings.openrouterReferer)
-          .onChange(async (v) => {
-            this.plugin.settings.openrouterReferer = v.trim();
-            await this.plugin.saveData(this.plugin.settings);
-          }),
-      );
-    new Setting(containerEl)
-      .setName("X-Title (optional)")
-      .setDesc("App name shown on openrouter.ai rankings.")
-      .addText((t) =>
-        t
-          .setValue(this.plugin.settings.openrouterAppName)
-          .onChange(async (v) => {
-            this.plugin.settings.openrouterAppName = v.trim();
-            await this.plugin.saveData(this.plugin.settings);
-          }),
-      );
-
+    // ---------------------------------------------------------------------
+    // Notifications
+    // ---------------------------------------------------------------------
     containerEl.createEl("h3", { text: "Notifications" });
     new Setting(containerEl)
       .setName("Notify on error")
@@ -749,4 +1044,202 @@ class KusterInboxSettingTab extends PluginSettingTab {
           }),
       );
   }
+}
+
+// ============================================================================
+// Template generation + CLAUDE.md seed
+// ============================================================================
+
+// Default templates keyed by linkType. The plugin generates whichever the
+// slot needs. Each one matches the shape of the existing 0. Inbox templates
+// (read/reviewed/handled triplet, `{{title}}` placeholder, frontmatter
+// `destination`/`url`/`tags` lines that the plugin fills in).
+const DEFAULT_TEMPLATES: Record<string, string> = {
+  link: `---
+created: {{date:YYYY-MM-DDTHH:mm}}
+updated: {{date:YYYY-MM-DDTHH:mm}}
+status: "⏳ To Process"
+destination:
+url:
+tags: []
+source: "{{title}}"
+---
+
+# {{title}}
+
+- [ ] read #inbox/pending
+- [ ] reviewed #inbox/reviewed
+- [ ] processed #inbox/processed
+
+## 🔗 Source
+URL: {{url}}
+
+## 📸 Screenshot
+![[../attachments/{{date:YYYYMMDDHHmmss}}.jpg]]
+
+## 📝 Context
+
+*Quick note about why this is saved*
+
+## 🔖 Key Points
+
+*Fill during processing*
+
+## 🔗 Related
+-
+
+---
+
+**Captured:** {{date:YYYY-MM-DD HH:mm}}
+`,
+  media: `---
+created: {{date:YYYY-MM-DDTHH:mm}}
+updated: {{date:YYYY-MM-DDTHH:mm}}
+status: "📺 To Watch"
+category: # tv-show | movie | book | game | podcast
+rating:
+destination:
+url:
+tags: [media]
+---
+
+# {{title}}
+
+- [ ] read #inbox/pending
+- [ ] processed #inbox/processed
+
+## User Feedback
+
+Users feedback for the note goes here
+
+## 📊 Info
+
+**Year:**
+**Director/Author:**
+**Genre:**
+
+## 💭 Thoughts
+
+*Add notes after watching/reading*
+
+## ⭐ Rating
+
+*Rate after completion*
+
+---
+
+**Added:** {{date:YYYY-MM-DD}}
+`,
+  task: `---
+created: {{date:YYYY-MM-DDTHH:mm}}
+updated: {{date:YYYY-MM-DDTHH:mm}}
+status: "⏳ To Do"
+category: task
+priority: # high | medium | low
+destination:
+url:
+tags: [task]
+---
+
+# {{title}}
+
+- [ ] read #inbox/pending
+- [ ] processed #inbox/processed
+
+## User Feedback
+
+Users feedback for the note goes here
+
+## Steps
+
+- [ ]
+
+## Notes
+
+*Context and details*
+
+## 🔗 Related
+-
+
+---
+
+**Created:** {{date:YYYY-MM-DD}}
+`,
+  custom: `---
+created: {{date:YYYY-MM-DDTHH:mm}}
+updated: {{date:YYYY-MM-DDTHH:mm}}
+status: "⏳ To Process"
+destination:
+url:
+tags: []
+source: "{{title}}"
+---
+
+# {{title}}
+
+- [ ] read #inbox/pending
+- [ ] reviewed #inbox/reviewed
+- [ ] processed #inbox/processed
+
+## 🔗 Source
+URL: {{url}}
+
+## 📝 Context
+
+*Quick note about why this is saved*
+
+## 🔖 Key Points
+
+*Fill during processing*
+
+## 🔗 Related
+-
+
+---
+
+**Captured:** {{date:YYYY-MM-DD HH:mm}}
+`,
+};
+
+function seedClaudeContext(): string {
+  return `# Inbox Processor — Classification Context
+
+This file is read by the **Kuster Inbox Processor** plugin and passed to the LLM
+as system context. Anything you write here is treated as guidance for how to
+classify iOS-shared links into PARA destinations and link-types.
+
+## Vault layout (PARA)
+
+- \`0. Inbox/\` — capture zone. Subfolders: \`Links/\`, \`Media/\`, \`Tasks/\`, \`Research/\`, \`Reference/\`, \`Decision Records/\`, \`Handoffs/\`, \`Dailies/\`, \`Copy Templates/\`.
+- \`1. Projects/\` — active outcomes with a finish line. One folder per project.
+- \`2. Areas/\` — ongoing responsibilities (no finish line). E.g. Health, Finance, Homelab.
+- \`3. Resources/\` — reference material grouped by topic.
+- \`4. Archive/\` — completed/dormant notes.
+- \`5. System/\` — tooling, templates, agents, personas. NEVER classify here.
+
+## Classification rules
+
+1. If the link is a **movie, show, book, game, podcast, or album** → \`linkType: "media"\`, destination \`0. Inbox/Media/\`.
+2. If the link describes **something to do** (a tutorial step, a config to apply, a bug to file, a setup to complete) → \`linkType: "task"\`, destination \`0. Inbox/Tasks/\`.
+3. Otherwise it's **a read-once resource** (article, repo, video, blog post, tool page) → \`linkType: "link"\`, destination \`0. Inbox/Links/\`.
+4. After it lands in the inbox, **I** will move it to a final PARA destination (\`1. Projects/<Name>/\`, \`2. Areas/<Name>/\`, or \`3. Resources/<topic>/\`). Don't pre-classify into those — keep the inbox the inbox.
+
+## Tagging guidance
+
+- Prefer 2-5 lower-case tags.
+- Reuse existing tags where possible (e.g. \`self-hosting\`, \`ai\`, \`3d-printing\`, \`dotnet\`).
+- Don't invent compound tags like \`ai-tool\` — use \`ai\` + \`tools\`.
+- Avoid generic tags like \`link\`, \`article\`, \`interesting\`.
+
+## Examples
+
+| URL | linkType | destination |
+|---|---|---|
+| github.com/some/repo | \`link\` | \`0. Inbox/Links\` |
+| imdb.com/title/tt123 | \`media\` | \`0. Inbox/Media\` |
+| "how to set up nginx" | \`link\` | \`0. Inbox/Links\` |
+| "fix X bug by running Y" | \`task\` | \`0. Inbox/Tasks\` |
+| youtube.com/watch?v=… (tutorial) | \`task\` | \`0. Inbox/Tasks\` |
+| youtube.com/watch?v=… (talk/essay) | \`link\` | \`0. Inbox/Links\` |
+`;
 }
