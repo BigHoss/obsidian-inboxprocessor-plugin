@@ -58,7 +58,7 @@ Link Inbox Processor
      └── writes note to   0. Inbox/Links/  (or Media/, Tasks/, or deeper PARA paths)
      │
      ▼
-You process notes, mark `handled` when done.
+You process notes, tick `read` once acknowledged, tick `processed` when done.
 Plugin can also scan subfolders and move "done" notes to their final PARA destination.
 ```
 
@@ -155,6 +155,20 @@ The **Create if missing** button writes a starter `CLAUDE.md` describing your PA
 
 ---
 
+## Inbox checkbox convention (ADR-001)
+
+Every note the plugin writes carries a 2-checkbox pair immediately after the title:
+
+```markdown
+- [ ] read #inbox/pending
+- [ ] processed #inbox/processed
+```
+
+- `read` — you tick this when you've read the note
+- `processed` — the plugin ticks this when it has finished with the note (moved it to its final PARA destination, or — for Media/Reference/Tasks — marked it as settled)
+
+This is the convention locked by [`ADR-001`](https://github.com/BigHoss/obsidian-inboxprocessor-plugin) and documented at `5. System/Templates/Inbox/README - Inbox Templates.md`. The MSC / Homelab project `read / reviewed / handled` triplet does **not** apply to the inbox — it's project-scoped.
+
 ## Commands
 
 - **Process inbox links now** — `Ctrl+Shift+P` (default). Process every line below the marker.
@@ -194,7 +208,7 @@ The plugin also fills blank `destination:`, `url:`, and `tags: []` frontmatter l
 
 ## Roadmap
 
-- [ ] **Auto-move on `handled`** — after the inbox pass, scan `0. Inbox/Links/`, `Media/`, `Tasks/`, `Research/` for notes whose `- [x] handled` checkbox is ticked, then move them to their frontmatter `destination:` path. Dry-run by default; real move behind a second confirmation.
+- [ ] **Auto-move on `processed`** — after the inbox pass, scan `0. Inbox/Links/`, `Media/`, `Tasks/`, `Research/` for notes whose `- [x] processed #inbox/processed` checkbox is ticked, then move them to their frontmatter `destination:` path. Dry-run by default; real move behind a second confirmation.
 - [ ] **Bulk class-rebalance** — re-classify notes in a folder if you change the rules in `CLAUDE.md`.
 - [ ] **Daily-note auto-processing** — pick up links pasted into today's daily note and route them through the same pipeline.
 - [ ] **Capture status in inbox** — show a small per-line checkmark next to lines that the LLM already classified, so you don't reprocess them.

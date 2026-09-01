@@ -1093,12 +1093,13 @@ class KusterInboxSettingTab extends PluginSettingTab {
 
 // Default templates keyed by linkType. The plugin generates whichever the
 // slot needs. Each one matches the shape of the existing 0. Inbox templates
-// (read/reviewed/handled triplet, `{{title}}` placeholder, frontmatter
-// `destination`/`url`/`tags` lines that the plugin fills in).
+// (read/processed pair, `{{title}}` placeholder, frontmatter
+// `destination`/`url`/`tags` lines that the plugin fills in). The 2-checkbox
+// convention is locked by ADR-001 in 5. System/Decision Records/.
 const DEFAULT_TEMPLATES: Record<string, string> = {
   link: `---
-created: {{date:YYYY-MM-DDTHH:mm}}
-updated: {{date:YYYY-MM-DDTHH:mm}}
+created: {{date:YYYYMMDDHHmmss}}
+updated: {{date:YYYYMMDDHHmmss}}
 status: "⏳ To Process"
 destination:
 url:
@@ -1109,7 +1110,6 @@ source: "{{title}}"
 # {{title}}
 
 - [ ] read #inbox/pending
-- [ ] reviewed #inbox/reviewed
 - [ ] processed #inbox/processed
 
 ## 🔗 Source
@@ -1134,10 +1134,10 @@ URL: {{url}}
 **Captured:** {{date:YYYY-MM-DD HH:mm}}
 `,
   media: `---
-created: {{date:YYYY-MM-DDTHH:mm}}
-updated: {{date:YYYY-MM-DDTHH:mm}}
+created: {{date:YYYYMMDDHHmmss}}
+updated: {{date:YYYYMMDDHHmmss}}
 status: "📺 To Watch"
-category: # tv-show | movie | book | game | podcast
+category: tv-show
 rating:
 destination:
 url:
@@ -1151,7 +1151,7 @@ tags: [media]
 
 ## User Feedback
 
-Users feedback for the note goes here
+User feedback for the note goes here
 
 ## 📊 Info
 
@@ -1172,11 +1172,11 @@ Users feedback for the note goes here
 **Added:** {{date:YYYY-MM-DD}}
 `,
   task: `---
-created: {{date:YYYY-MM-DDTHH:mm}}
-updated: {{date:YYYY-MM-DDTHH:mm}}
+created: {{date:YYYYMMDDHHmmss}}
+updated: {{date:YYYYMMDDHHmmss}}
 status: "⏳ To Do"
 category: task
-priority: # high | medium | low
+priority: medium
 destination:
 url:
 tags: [task]
@@ -1189,7 +1189,7 @@ tags: [task]
 
 ## User Feedback
 
-Users feedback for the note goes here
+User feedback for the note goes here
 
 ## Steps
 
@@ -1207,8 +1207,8 @@ Users feedback for the note goes here
 **Created:** {{date:YYYY-MM-DD}}
 `,
   custom: `---
-created: {{date:YYYY-MM-DDTHH:mm}}
-updated: {{date:YYYY-MM-DDTHH:mm}}
+created: {{date:YYYYMMDDHHmmss}}
+updated: {{date:YYYYMMDDHHmmss}}
 status: "⏳ To Process"
 destination:
 url:
@@ -1219,7 +1219,6 @@ source: "{{title}}"
 # {{title}}
 
 - [ ] read #inbox/pending
-- [ ] reviewed #inbox/reviewed
 - [ ] processed #inbox/processed
 
 ## 🔗 Source
@@ -1264,6 +1263,20 @@ classify iOS-shared links into PARA destinations and link-types.
 2. If the link describes **something to do** (a tutorial step, a config to apply, a bug to file, a setup to complete) → \`linkType: "task"\`, destination \`0. Inbox/Tasks/\`.
 3. Otherwise it's **a read-once resource** (article, repo, video, blog post, tool page) → \`linkType: "link"\`, destination \`0. Inbox/Links/\`.
 4. After it lands in the inbox, **I** will move it to a final PARA destination (\`1. Projects/<Name>/\`, \`2. Areas/<Name>/\`, or \`3. Resources/<topic>/\`). Don't pre-classify into those — keep the inbox the inbox.
+
+## Inbox checkbox convention (locked by ADR-001)
+
+Every note that lands in the inbox uses this 2-checkbox pair immediately after the title:
+
+\`\`\`markdown
+- [ ] read #inbox/pending
+- [ ] processed #inbox/processed
+\`\`\`
+
+- \`read\` = the user has read/acknowledged this note
+- \`processed\` = the plugin has finished with it (moved to final destination, or — for Media/Reference/Tasks — marked as settled)
+
+Do not invent other checkbox states. The MSC / Homelab project convention uses a 3-checkbox \`read / reviewed / handled\` triplet but **that convention does NOT apply to the inbox** — it's project-scoped.
 
 ## Tagging guidance
 
