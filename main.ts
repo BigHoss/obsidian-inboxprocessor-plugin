@@ -522,6 +522,20 @@ export default class KusterInboxPlugin extends Plugin {
       this.app.workspace.on("file-menu", (menu, file) => {
         if (!(file instanceof TFile)) return;
         if (file.path.startsWith(this.settings.archiveRoot + "/")) return;
+
+        // "Convert to project" — file-menu variant. Reads the file content
+        // and passes it as the initial plan seed (instead of an editor
+        // selection, which doesn't apply in the file explorer context).
+        menu.addItem((item) =>
+          item
+            .setTitle("Convert to project…")
+            .setIcon("folder-plus")
+            .onClick(async () => {
+              const content = await this.app.vault.cachedRead(file);
+              await this.createProjectFromSelection(content);
+            }),
+        );
+
         menu.addItem((item) =>
           item
             .setTitle("Move to archive (with archivedAt timestamp)")
