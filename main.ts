@@ -1,10 +1,11 @@
 /**
- * Kuster Inbox Processor
+ * Link Inbox Processor
  * ------------------------
  * Reads 0. Inbox/0. Inbox.md, finds lines below the iOS Share-Target marker,
  * fetches og:title/og:description/og:image for each URL, renders a note
- * from the configured template, writes it to 0. Inbox/Links/, and atomically
- * removes only the successfully-processed lines from the inbox file.
+ * from the configured template, writes it to 0. Inbox/Links/ (or a per-type
+ * destination), and atomically removes only the successfully-processed lines
+ * from the inbox file.
  *
  * Atomic & idempotent: each line is processed independently; failures leave
  * the line in place for the next run. The inbox file is rewritten via a
@@ -91,7 +92,7 @@ const DEFAULT_SETTINGS: KusterInboxSettings = {
   openrouterApiKey: "",
   openrouterModel: "openrouter/auto-beta",
   openrouterReferer: "https://github.com/BigHoss/obsidian-inboxprocessor-plugin",
-  openrouterAppName: "Kuster Inbox Processor",
+  openrouterAppName: "Link Inbox Processor",
   llmEnabled: false,
   claudeContextPath: "0. Inbox/CLAUDE.md",
   allowedDestinationRoots: [
@@ -105,7 +106,7 @@ const DEFAULT_SETTINGS: KusterInboxSettings = {
   maxLinksPerRun: 50,
   notifyOnError: false,
   notifyUrl: "",
-  userAgent: "Mozilla/5.0 (Kuster-InboxProcessor/0.1)",
+  userAgent: "Mozilla/5.0 (Link-InboxProcessor/0.2)",
 };
 
 // ============================================================================
@@ -431,7 +432,7 @@ async function notifyError(settings: KusterInboxSettings, msg: string): Promise<
       url: settings.notifyUrl,
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title: "Kuster Inbox Processor", body: msg }),
+      body: JSON.stringify({ title: "Link Inbox Processor", body: msg }),
       throw: false,
     });
   } catch {
@@ -728,7 +729,7 @@ class KusterInboxSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "Kuster Inbox Processor" });
+    containerEl.createEl("h2", { text: "Link Inbox Processor" });
 
     // ---------------------------------------------------------------------
     // Vault paths
@@ -779,94 +780,134 @@ class KusterInboxSettingTab extends PluginSettingTab {
       cls: "setting-item-description",
     });
 
+    // Inject scoped CSS for the link-type table. This stays in the settings
+    // tab only — we tear it down on every re-render so styles don't leak
+    // when the user navigates away.
+    if (!containerEl.querySelector("#kip-table-style")) {
+      containerEl.createEl("style", {
+        attr: { id: "kip-table-style" },
+        text: `
+          .kip-table { display: grid; gap: 6px; margin: 8px 0; }
+          .kip-table-header, .kip-table-row {
+            display: grid;
+            grid-template-columns: 100px 1.4fr 1.6fr 1.2fr 1.4fr;
+            gap: 8px;
+            align-items: center;
+          }
+          .kip-table-header {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: var(--text-muted);
+            padding: 0 4px;
+          }
+          .kip-table-row {
+            background: var(--background-secondary);
+            border: 1px solid var(--background-modifier-border);
+            border-radius: 6px;
+            padding: 6px 8px;
+          }
+          .kip-table-row input[type="text"] {
+            width: 100%;
+            margin: 0;
+            font-size: 12px;
+          }
+          .kip-table-actions {
+            display: flex;
+            gap: 4px;
+            justify-content: flex-end;
+          }
+          .kip-table-actions button {
+            padding: 2px 8px;
+            font-size: 11px;
+          }
+          @media (max-width: 800px) {
+            .kip-table-header { display: none; }
+            .kip-table-row { grid-template-columns: 1fr; }
+          }
+        `,
+      });
+    }
+
     const renderTemplateRows = () => {
       const wrapId = "kip-template-rows";
       const existing = containerEl.querySelector(`#${wrapId}`);
       if (existing) existing.remove();
-      const wrap = containerEl.createDiv({ attr: { id: wrapId } });
+      const wrap = containerEl.createDiv({ attr: { id: wrapId, class: "kip-table" } });
+
+      // Header row
+      const header = wrap.createDiv({ cls: "kip-table-header" });
+      header.createEl("div", { text: "linkType" });
+      header.createEl("div", { text: "Hint (sent to LLM)" });
+      header.createEl("div", { text: "Template path" });
+      header.createEl("div", { text: "Default destination" });
+      header.createEl("div", { text: "Actions", attr: { style: "text-align: right;" } });
+
+      // Data rows
       this.plugin.settings.templates.forEach((slot, idx) => {
-        const row = wrap.createDiv({ cls: "kip-template-row" });
-        const linkTypeSetting = new Setting(row)
-          .setName(`Type #${idx + 1}: linkType`)
-          .addText((t) =>
-            t
-              .setPlaceholder("link")
-              .setValue(slot.linkType)
-              .onChange(async (v) => {
-                this.plugin.settings.templates[idx].linkType = v.trim();
-                await this.plugin.saveData(this.plugin.settings);
-              }),
-          );
-        new Setting(row)
-          .setName("Hint (sent to the LLM)")
-          .addText((t) =>
-            t
-              .setPlaceholder("Web articles, tools, tutorials, repos, blog posts")
-              .setValue(slot.hint)
-              .onChange(async (v) => {
-                this.plugin.settings.templates[idx].hint = v;
-                await this.plugin.saveData(this.plugin.settings);
-              }),
-          );
-        new Setting(row)
-          .setName("Template path")
-          .addText((t) =>
-            t
-              .setPlaceholder("5. System/Templates/Inbox/My Template.md")
-              .setValue(slot.templatePath)
-              .onChange(async (v) => {
-                this.plugin.settings.templates[idx].templatePath = v.trim();
-                await this.plugin.saveData(this.plugin.settings);
-              }),
-          );
-        new Setting(row)
-          .setName("Default destination")
-          .addText((t) =>
-            t
-              .setPlaceholder("0. Inbox/Links")
-              .setValue(slot.defaultDestination)
-              .onChange(async (v) => {
-                this.plugin.settings.templates[idx].defaultDestination = v.trim();
-                await this.plugin.saveData(this.plugin.settings);
-              }),
-          );
-        const actions = new Setting(row);
-        actions.addButton((b) =>
-          b
-            .setButtonText("Generate default template")
-            .setWarning()
-            .onClick(async () => {
-              await this.plugin.generateTemplate(slot);
-              new Notice(`Template written to ${slot.templatePath}`);
-            }),
-        );
-        actions.addButton((b) =>
-          b
-            .setButtonText("Remove")
-            .setWarning()
-            .onClick(async () => {
-              this.plugin.settings.templates.splice(idx, 1);
-              await this.plugin.saveData(this.plugin.settings);
-              renderTemplateRows();
-            }),
-        );
+        const row = wrap.createDiv({ cls: "kip-table-row" });
+        row.createEl("input", {
+          attr: { type: "text", placeholder: "link" },
+          value: slot.linkType,
+        }).addEventListener("change", async (e) => {
+          const v = (e.target as HTMLInputElement).value;
+          this.plugin.settings.templates[idx].linkType = v.trim();
+          await this.plugin.saveData(this.plugin.settings);
+        });
+        row.createEl("input", {
+          attr: { type: "text", placeholder: "Web articles, tools, tutorials, repos" },
+          value: slot.hint,
+        }).addEventListener("change", async (e) => {
+          const v = (e.target as HTMLInputElement).value;
+          this.plugin.settings.templates[idx].hint = v;
+          await this.plugin.saveData(this.plugin.settings);
+        });
+        row.createEl("input", {
+          attr: { type: "text", placeholder: "5. System/Templates/Inbox/My Template.md" },
+          value: slot.templatePath,
+        }).addEventListener("change", async (e) => {
+          const v = (e.target as HTMLInputElement).value;
+          this.plugin.settings.templates[idx].templatePath = v.trim();
+          await this.plugin.saveData(this.plugin.settings);
+        });
+        row.createEl("input", {
+          attr: { type: "text", placeholder: "0. Inbox/Links" },
+          value: slot.defaultDestination,
+        }).addEventListener("change", async (e) => {
+          const v = (e.target as HTMLInputElement).value;
+          this.plugin.settings.templates[idx].defaultDestination = v.trim();
+          await this.plugin.saveData(this.plugin.settings);
+        });
+        const actions = row.createDiv({ cls: "kip-table-actions" });
+        const genBtn = actions.createEl("button", { text: "Generate" });
+        genBtn.title = "Write a starter template to the path if no file exists there";
+        genBtn.addEventListener("click", async () => {
+          await this.plugin.generateTemplate(slot);
+          new Notice(`Template written to ${slot.templatePath}`);
+        });
+        const delBtn = actions.createEl("button", { text: "✕" });
+        delBtn.title = "Remove this link-type";
+        delBtn.addEventListener("click", async () => {
+          this.plugin.settings.templates.splice(idx, 1);
+          await this.plugin.saveData(this.plugin.settings);
+          renderTemplateRows();
+        });
       });
-      const addRow = new Setting(wrap)
-        .addButton((b) =>
-          b
-            .setButtonText("+ Add link-type")
-            .onClick(async () => {
-              this.plugin.settings.templates.push({
-                linkType: "custom",
-                templatePath: "5. System/Templates/Inbox/Custom Template.md",
-                hint: "Describe what this type is for.",
-                defaultDestination: "0. Inbox/Links",
-              });
-              await this.plugin.saveData(this.plugin.settings);
-              renderTemplateRows();
-            }),
-        );
-      void linkTypeSetting; // (silence unused-var; Setting needs to be constructed)
+
+      // Add-row footer
+      const footer = wrap.createDiv({ attr: { style: "display: flex; justify-content: flex-end; padding-top: 4px;" } });
+      const addBtn = footer.createEl("button", { text: "+ Add link-type" });
+      addBtn.addEventListener("click", async () => {
+        this.plugin.settings.templates.push({
+          linkType: "custom",
+          templatePath: "5. System/Templates/Inbox/Custom Template.md",
+          hint: "Describe what this type is for.",
+          defaultDestination: "0. Inbox/Links",
+        });
+        await this.plugin.saveData(this.plugin.settings);
+        renderTemplateRows();
+      });
     };
     renderTemplateRows();
 
@@ -1204,7 +1245,7 @@ URL: {{url}}
 function seedClaudeContext(): string {
   return `# Inbox Processor — Classification Context
 
-This file is read by the **Kuster Inbox Processor** plugin and passed to the LLM
+This file is read by the **Link Inbox Processor** plugin and passed to the LLM
 as system context. Anything you write here is treated as guidance for how to
 classify iOS-shared links into PARA destinations and link-types.
 

@@ -1,9 +1,9 @@
 {
   "id": "kuster-inbox-processor",
-  "name": "Kuster Inbox Processor",
+  "name": "Link Inbox Processor",
   "version": "0.2.0",
   "minAppVersion": "1.5.0",
-  "description": "Processes iOS-shared links from 0. Inbox/0. Inbox.md into templated notes in 0. Inbox/Links/. Atomic, idempotent, LLM-optional.",
+  "description": "Classifies iOS-shared links from 0. Inbox/0. Inbox.md and writes them as templated notes in your PARA vault. Atomic, idempotent, LLM-optional.",
   "author": "Raphael (Kuster.live)",
   "authorUrl": "https://github.com/BigHoss",
   "isDesktopOnly": false

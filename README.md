@@ -1,4 +1,4 @@
-# Kuster Inbox Processor
+Link Inbox Processor
 
 An Obsidian plugin that turns iOS-shared links into templated vault notes for a **PARA vault** — atomic, idempotent, LLM-optional.
 
@@ -51,7 +51,7 @@ Obsidian iOS app / Shortcuts  ── appends raw links below the marker
 0. Inbox/0. Inbox.md  (the iOS Share-Target section)
      │
      ▼   ctrl+shift+P / ribbon click / hotkey
-Kuster Inbox Processor
+Link Inbox Processor
      │
      ├── LLM classifies  → linkType + suggestedDestination
      ├── renders template by linkType
@@ -83,7 +83,7 @@ Anything else falls back to the slot's `defaultDestination`. This is a safety ra
 ## Install
 
 1. Make sure `0. Inbox/CLAUDE.md` exists (use the **Create if missing** button in settings to seed it).
-2. Restart Obsidian (after copying the plugin files) and enable **Kuster Inbox Processor** in **Settings → Community Plugins**.
+2. Restart Obsidian (after copying the plugin files) and enable **Link Inbox Processor** in **Settings → Community Plugins**.
 3. Set your OpenRouter API key in settings if you want LLM enrichment.
 
 ### From this repo
@@ -105,7 +105,7 @@ Drop `main.js`, `manifest.json`, and `styles.css` into `<vault>/.obsidian/plugin
 
 ## Configuration
 
-Open Obsidian → Settings → Kuster Inbox Processor.
+Open Obsidian → Settings → Link Inbox Processor.
 
 ### Vault paths
 | Field | Default |
@@ -139,7 +139,7 @@ The **Create if missing** button writes a starter `CLAUDE.md` describing your PA
 | OpenRouter API key | *(empty — get one at https://openrouter.ai/keys)* |
 | OpenRouter model | `openrouter/auto-beta` (cheapest routing; switch to any model on https://openrouter.ai/models) |
 | HTTP-Referer | `https://github.com/BigHoss/obsidian-inboxprocessor-plugin` |
-| X-Title | `Kuster Inbox Processor` |
+| X-Title | `Link Inbox Processor` |
 
 ### Behavior
 | Field | Default |

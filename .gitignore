@@ -2,4 +2,6 @@ node_modules/
 *.log
 .DS_Store
 data.json
+
+# Hermes working-state — drafts, scratchpads, work notes. Not source.
 .hermes/
