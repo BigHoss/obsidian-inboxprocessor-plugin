@@ -1,22 +1,54 @@
-Link Inbox Processor
+# Link Inbox Processor
 
-An Obsidian plugin that turns iOS-shared links into templated vault notes for a **PARA vault** — atomic, idempotent, LLM-optional.
+An Obsidian plugin that turns iOS-shared links into templated vault notes
+for a **PARA vault**, archives notes on demand, and scaffolds new projects
+from inbox selections — atomic, idempotent, LLM-optional.
 
 ## What it does
 
-Reads the iOS Share-Target block at the bottom of `0. Inbox/0. Inbox.md` (delimited by the marker comment), and for each link:
+**Link inbox processing.** Reads the iOS Share-Target block at the bottom
+of `0. Inbox/0. Inbox.md` (delimited by the marker comment), and for each
+link:
 
 1. Parses `[title](url)` or bare URL
-2. *(Optional, LLM enabled)* Sends the URL to OpenRouter — the LLM fetches the page itself via its web-fetch / browser tool, classifies the link into a `linkType`, picks a PARA destination, and returns `{ refinedTitle, linkType, suggestedDestination, suggestedTags, description, siteName }`
-3. Picks the template whose `linkType` matches (falls back to the default if LLM is off)
-4. Writes the note to the LLM-suggested destination (or the slot's default), e.g. `0. Inbox/Links/<stamp> - <Title>.md` or `3. Resources/AI/<stamp> - <Title>.md`
-5. Atomically removes only the successfully-processed lines from the inbox file
+2. *(Optional, LLM enabled)* Sends the URL to OpenRouter — the LLM fetches
+   the page itself via its web-fetch / browser tool, classifies the link
+   into a `linkType`, picks a PARA destination, and returns
+   `{ refinedTitle, linkType, suggestedDestination, suggestedTags,
+   description, siteName }`
+3. Picks the template whose `linkType` matches (falls back to the default
+   if LLM is off)
+4. Writes the note to the LLM-suggested destination (or the slot's
+   default), e.g. `0. Inbox/Links/<stamp> - <Title>.md` or
+   `3. Resources/AI/<stamp> - <Title>.md`
+5. Atomically removes only the successfully-processed lines from the
+   inbox file
 
-Failed lines are kept in the inbox for the next run — eventual progress, never a stuck state. Every failure is also appended to an **out-of-vault log** so you can audit them later.
+Failed lines are kept in the inbox for the next run — eventual progress,
+never a stuck state. Every failure is also appended to an **out-of-vault
+log** so you can audit them later.
 
-**No more direct page fetching from Obsidian.** The plugin never calls `requestUrl` on the destination URL anymore — that dodges Cloudflare bot-protection (the 403 you used to see on `printables.com` etc.) because OpenRouter's providers have real browsers.
+**Move to archive.** Right-click any file → "Move to archive (with
+archivedAt timestamp)" mirrors the source path under `<archiveRoot>/`
+and writes an ISO `archivedAt` timestamp into the frontmatter.
+`1. Projects/Homelab Manager/Plan.md` →
+`4. Archive/1. Projects/Homelab Manager/Plan.md`.
 
----
+**Create project from selection.** Select text in any note → run command
+→ the plugin reads numbered subfolders of `<projectsRoot>/` live, asks
+which type + name + key, then shells out to your existing
+`init-project.py` (Project Folder Template script). The selected text
+seeds the new project's `v0.1/Plan.md`.
+
+**Cron.** Opt-in automatic inbox processing every N minutes. Notices
+suppressed during cron runs; failures still go to the failure log.
+
+**No more direct page fetching from Obsidian.** The plugin never calls
+`requestUrl` on the destination URL anymore — that dodges Cloudflare
+bot-protection (the 403 you used to see on `printables.com` etc.)
+because OpenRouter's providers have real browsers.
+
+
 
 ## How this fits a PARA vault
 
@@ -101,6 +133,23 @@ Copy `main.js`, `manifest.json`, `styles.css` to `<vault>/.obsidian/plugins/kust
 ### Manual
 
 Drop `main.js`, `manifest.json`, and `styles.css` into `<vault>/.obsidian/plugins/kuster-inbox-processor/`, then enable the plugin in Obsidian settings.
+
+### Distribution via BRAT (recommended for cross-device sync)
+
+The repo is private. To install on every device and auto-update on every
+`git push` to `main`, use **Obsidian42 - BRAT**:
+
+1. Install **BRAT** from Community Plugins on each device.
+2. Open BRAT settings → **Add Beta plugin** →
+   `BigHoss/obsidian-inboxprocessor-plugin`.
+3. BRAT will ask for a GitHub PAT if the repo is private. Generate one at
+   <https://github.com/settings/tokens> (scope: `repo`). Paste it into
+   BRAT's settings page (not the plugin entry — BRAT stores the token
+   globally).
+4. Enable **Link Inbox Processor** in **Settings → Community Plugins**.
+5. Every push to `main` triggers a BRAT update on each device within ~1h.
+
+No GitHub Releases needed — BRAT pulls `main.js` + `manifest.json` directly.
 
 ---
 

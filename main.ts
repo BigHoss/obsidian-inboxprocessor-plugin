@@ -67,6 +67,16 @@ interface KusterInboxSettings {
   notifyUrl: string;
   // Show a per-link "Fetching via LLM…" notice while the LLM is processing.
   showFetchNotices: boolean;
+  // Cron-style automatic inbox processing. Off by default to avoid surprise.
+  cronEnabled: boolean;
+  cronIntervalMinutes: number;
+  cronRunOnStartup: boolean;
+  // Archive root — "Move to archive" mirrors source path under this folder.
+  archiveRoot: string;
+  // Project scaffold — reads subfolders of projectsRoot/ at modal-open time.
+  projectsRoot: string;
+  // Vault-relative path to init-project.py (the Python scaffolding tool).
+  templateScriptPath: string;
 }
 
 const DEFAULT_SETTINGS: KusterInboxSettings = {
@@ -110,6 +120,12 @@ const DEFAULT_SETTINGS: KusterInboxSettings = {
   notifyOnError: false,
   notifyUrl: "",
   showFetchNotices: true,
+  cronEnabled: false,
+  cronIntervalMinutes: 15,
+  cronRunOnStartup: false,
+  archiveRoot: "4. Archive",
+  projectsRoot: "1. Projects",
+  templateScriptPath: "5. System/Templates/Project Folder Template/scripts/init-project.py",
 };
 
 // ============================================================================
@@ -187,12 +203,63 @@ function parseLine(line: string): ParsedLine | null {
   return null;
 }
 
+// Strip filesystem-hostile characters from a candidate filename.
 function sanitizeFilename(s: string): string {
   return s
     .replace(/[<>:"/\\|?*\x00-\x1F]/g, "")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 120);
+}
+
+// Humanize a title the LLM or iOS Share Sheet produced. Strips site suffixes
+// (" | GitHub", " — Reddit", " - YouTube"), trailing parenthetical groups
+// (" (post)"), bracket-wrapped site names ("[thingiverse.com]"), emojis,
+// multiple whitespace, query-string-looking cruft, and truncates at the last
+// word boundary under 100 chars. Pure function — no side effects.
+function cleanTitle(raw: string | null | undefined): string {
+  if (!raw) return "";
+  let s = String(raw).trim();
+
+  // If the whole title is wrapped in ONE matching bracket pair, unwrap it.
+  // Handles "[thingiverse thing]" → "thingiverse thing". Repeated until no
+  // more wrapping brackets — catches "[[nested]]" too.
+  let prev = "";
+  while (prev !== s) {
+    prev = s;
+    const m = s.match(/^\s*([\[\{\(])\s*(.+?)\s*([\]\}\)])\s*$/);
+    if (m && m[1] === "[" && m[3] === "]") s = m[2];
+    else if (m && m[1] === "(" && m[3] === ")") s = m[2];
+    else if (m && m[1] === "{" && m[3] === "}") s = m[2];
+  }
+
+  // Drop query-string-style fragments anywhere.
+  s = s.replace(/\?[^\s]*/g, "");
+
+  // Drop emoji (basic surrogate-pair range + common unicode blocks).
+  s = s.replace(
+    /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{1F000}-\u{1F2FF}]/gu,
+    "",
+  );
+
+  // Site-suffix stripper: " | GitHub", " - Reddit", " — Printables", etc.
+  // Anchored at end-of-string only so it doesn't gut middle content.
+  s = s.replace(
+    /\s*[\|—–\-]\s*(github|reddit|printables|thingiverse|youtube|twitter|x|imdb|hacker\s*news|medium|stackoverflow|stack\s*overflow|producthunt|ycombinator)\.?(com)?\s*$/i,
+    "",
+  );
+
+  // Collapse multiple spaces.
+  s = s.replace(/\s+/g, " ").trim();
+
+  // Truncate at last word boundary under 100 chars.
+  if (s.length > 100) {
+    const cut = s.slice(0, 100);
+    const lastSpace = cut.lastIndexOf(" ");
+    s = lastSpace > 40 ? cut.slice(0, lastSpace) : cut;
+    s = s.trim();
+  }
+  return s;
 }
 
 function nowStamp(): string {
@@ -398,6 +465,8 @@ async function notifyError(settings: KusterInboxSettings, msg: string): Promise<
 export default class KusterInboxPlugin extends Plugin {
   settings: KusterInboxSettings = DEFAULT_SETTINGS;
   private statusBarEl: HTMLElement | null = null;
+  private cronIntervalId: number | null = null;
+  private lastRunAt: number | null = null;
 
   async onload(): Promise<void> {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -422,6 +491,47 @@ export default class KusterInboxPlugin extends Plugin {
         void this.processSingleLine(line);
       },
     });
+
+    // Command: create project from selection (reads projectsRoot/<Type>/
+    // subfolders live from vault; shells out to init-project.py).
+    this.addCommand({
+      id: "create-project-from-selection",
+      name: "Create project from selection",
+      editorCallback: async (editor: Editor, view: MarkdownView) => {
+        const selection = editor.getSelection();
+        await this.createProjectFromSelection(selection);
+      },
+    });
+
+    // Command: move the current file to archive (mirrors source path under
+    // <archiveRoot>/). Adds `archivedAt` to frontmatter.
+    this.addCommand({
+      id: "move-to-archive",
+      name: "Move to archive (with archivedAt timestamp)",
+      checkCallback: (checking) => {
+        const f = this.app.workspace.getActiveFile();
+        const ok = f instanceof TFile && !f.path.startsWith(this.settings.archiveRoot + "/");
+        if (checking) return ok;
+        if (ok) void this.moveToArchive(f as TFile);
+      },
+    });
+
+    // File-menu hook — injects "Move to archive" into the right-click menu
+    // for any file that isn't already in the archive root.
+    this.registerEvent(
+      this.app.workspace.on("file-menu", (menu, file) => {
+        if (!(file instanceof TFile)) return;
+        if (file.path.startsWith(this.settings.archiveRoot + "/")) return;
+        menu.addItem((item) =>
+          item
+            .setTitle("Move to archive (with archivedAt timestamp)")
+            .setIcon("archive")
+            .onClick(async () => {
+              await this.moveToArchive(file);
+            }),
+        );
+      }),
+    );
 
     this.addSettingTab(new KusterInboxSettingTab(this.app, this));
 
@@ -490,6 +600,31 @@ export default class KusterInboxPlugin extends Plugin {
         if (f.path === this.settings.inboxFile) this.refreshStatusBar();
       }),
     );
+
+    // Cron-style automatic inbox processing. Off by default — user must
+    // opt in. If enabled, register an interval that calls processInbox
+    // silently. Reload Obsidian after changing cron settings (no live
+    // re-registration — keeps the registration path simple).
+    if (this.settings.cronEnabled) {
+      this.applyCron();
+      if (this.settings.cronRunOnStartup) {
+        // Fire-and-forget; doesn't block onload.
+        void this.processInbox({ silent: true });
+      }
+    }
+  }
+
+  // Register (or clear) the cron interval based on current settings.
+  private applyCron(): void {
+    if (this.cronIntervalId !== null) {
+      window.clearInterval(this.cronIntervalId);
+      this.cronIntervalId = null;
+    }
+    if (!this.settings.cronEnabled) return;
+    const ms = Math.max(1, this.settings.cronIntervalMinutes) * 60 * 1000;
+    this.cronIntervalId = window.setInterval(() => {
+      void this.processInbox({ silent: true });
+    }, ms);
   }
 
   onunload(): void {
@@ -499,9 +634,12 @@ export default class KusterInboxPlugin extends Plugin {
   async refreshStatusBar(): Promise<void> {
     if (!this.statusBarEl) return;
     const count = await this.countPending();
-    this.statusBarEl.setText(
-      count > 0 ? `Inbox: ${count} pending` : "Inbox: clean",
-    );
+    const pending = count > 0 ? `${count} pending` : "clean";
+    const lastRun =
+      this.lastRunAt !== null
+        ? ` (last: ${formatHm(new Date(this.lastRunAt))})`
+        : "";
+    this.statusBarEl.setText(`Inbox: ${pending}${lastRun}`);
   }
 
   async countPending(): Promise<number> {
@@ -522,7 +660,8 @@ export default class KusterInboxPlugin extends Plugin {
     return f instanceof TFile ? f : null;
   }
 
-  async processInbox(): Promise<void> {
+  async processInbox(opts?: { silent?: boolean }): Promise<void> {
+    const silent = opts?.silent === true;
     const file = this.resolveFile(this.settings.inboxFile);
     if (!file) {
       new Notice(`Inbox file not found: ${this.settings.inboxFile}`);
@@ -575,9 +714,10 @@ export default class KusterInboxPlugin extends Plugin {
         continue;
       }
       try {
-        const onProgress = this.settings.showFetchNotices
-          ? (msg: string) => new Notice(`Inbox: ${i + 1}/${cap} — ${msg}`, 3000)
-          : undefined;
+        const onProgress =
+          this.settings.showFetchNotices && !silent
+            ? (msg: string) => new Notice(`Inbox: ${i + 1}/${cap} — ${msg}`, 3000)
+            : undefined;
         const result = await this.processOne(parsed, templatesByType, defaultTemplate, onProgress);
         if (result === null) {
           // user chose Skip — link stays in inbox for next run
@@ -595,7 +735,7 @@ export default class KusterInboxPlugin extends Plugin {
         }
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        new Notice(`✗ ${parsed.url} — ${msg}`, 8000);
+        if (!silent) new Notice(`✗ ${parsed.url} — ${msg}`, 8000);
         survivors.push(line);
         failCount++;
         await appendFailureLog(this.app, this.manifest, parsed.url, msg);
@@ -610,11 +750,14 @@ export default class KusterInboxPlugin extends Plugin {
     const updated = head + tail;
     await this.app.vault.modify(file, updated);
 
-    new Notice(
-      `Inbox: ${okCount} processed, ${skipCount} skipped, ${failCount} kept for retry${
-        cap < lines.length && !aborted ? `, ${lines.length - cap} deferred` : ""
-      }${aborted ? " (aborted)" : ""}`,
-    );
+    this.lastRunAt = Date.now();
+    if (!silent) {
+      new Notice(
+        `Inbox: ${okCount} processed, ${skipCount} skipped, ${failCount} kept for retry${
+          cap < lines.length && !aborted ? `, ${lines.length - cap} deferred` : ""
+        }${aborted ? " (aborted)" : ""}`,
+      );
+    }
     this.refreshStatusBar();
   }
 
@@ -673,7 +816,9 @@ export default class KusterInboxPlugin extends Plugin {
 
     // 3. Compose title + filename
     const baseTitle = parsed.title ?? parsed.url;
-    const finalTitle = sanitizeFilename(llm?.refinedTitle ?? baseTitle);
+    const finalTitle = sanitizeFilename(
+      cleanTitle(llm?.refinedTitle) || cleanTitle(baseTitle) || "",
+    );
     const stamp = nowStamp();
     const filename = `${stamp} - ${finalTitle || "Untitled Link"}.md`;
     const notePath = `${destinationDir}/${filename}`;
@@ -748,6 +893,212 @@ export default class KusterInboxPlugin extends Plugin {
     }
     // Pathological — give up and let create throw
     return { kind: "write", path: notePath };
+  }
+
+  // Read live: numbered subfolders under <projectsRoot>/, sorted by leading
+  // number. Used to populate the project-type dropdown in the scaffold modal.
+  private async listProjectTypes(): Promise<ProjectTypeOption[]> {
+    const adapter = this.app.vault.adapter;
+    const root = this.settings.projectsRoot.replace(/\/+$/, "");
+    if (!(await adapter.exists(root))) return [];
+    const listing = await adapter.list(root);
+    const subsAll = await Promise.all(
+      listing.map(async (p) => {
+        const isDir =
+          (p as { isDirectory?: boolean }).isDirectory === true ||
+          (await adapter.exists(p.path));
+        return { p, isDir };
+      }),
+    );
+    const subs = subsAll
+      .filter(({ isDir }) => isDir)
+      .map(({ p }) => p)
+      .filter((p) => /^\d+\./.test(p.name))
+      .sort((a, b) => {
+        const na = parseInt(a.name, 10);
+        const nb = parseInt(b.name, 10);
+        return na - nb;
+      });
+    return subs.map((p) => ({
+      label: p.name,
+      value: p.name,
+      absPath: p.path,
+    }));
+  }
+
+  // Read the current note's selection (already passed in by editorCallback),
+  // show the modal, then spawn init-project.py. On success, open the new
+  // project's index note.
+  private async createProjectFromSelection(selection: string): Promise<void> {
+    const types = await this.listProjectTypes();
+    if (types.length === 0) {
+      new Notice(
+        `No numbered subfolders under "${this.settings.projectsRoot}/". Add at least one (e.g. "1. Coding") and retry.`,
+        10000,
+      );
+      return;
+    }
+    const result = await new Promise<ProjectScaffoldResult | null>((resolve) => {
+      new ProjectScaffoldModal(this.app, {
+        types,
+        projectsRoot: this.settings.projectsRoot,
+        templateScriptPath: this.settings.templateScriptPath,
+        initialPlan: selection,
+        onDone: (r) => resolve(r),
+      }).open();
+    });
+    if (!result) return;
+
+    const destDir = `${this.settings.projectsRoot}/${result.typeValue}/${result.name}`;
+    new Notice(`Scaffolding ${destDir}…`, 5000);
+
+    const py = await findPython();
+    if (!py) {
+      new Notice(
+        `Could not find Python (tried: python, python3, py -3). Install Python or update PATH, then retry.`,
+        10000,
+      );
+      await appendFailureLog(
+        this.app,
+        this.manifest,
+        "create-project-from-selection",
+        "Python not found on PATH",
+      );
+      return;
+    }
+    // Resolve vault-relative script path to absolute. basePath ends with
+    // the separator on some platforms and not others — normalise.
+    const basePath = this.app.vault.adapter.basePath.replace(/[/\\]+$/, "");
+    const sep = basePath.includes("\\") ? "\\" : "/";
+    const scriptAbsPath = this.settings.templateScriptPath.startsWith(basePath)
+      ? this.settings.templateScriptPath
+      : `${basePath}${sep}${this.settings.templateScriptPath.replace(/\//g, sep)}`;
+    const args = [
+      scriptAbsPath,
+      "--name", result.name,
+      "--key", result.key,
+      "--dst", destDir,
+    ];
+    let stdout = "";
+    let stderr = "";
+    let code = -1;
+    try {
+      const result2 = await new Promise<{ code: number; stdout: string; stderr: string }>(
+        (resolve, reject) => {
+          // Use Node child_process via require — bundled by esbuild since
+          // Node built-ins are not in the external list above.
+          // @ts-ignore — require available in Electron renderer with nodeIntegration
+          const cp = require("child_process");
+          const proc = cp.spawn(py.bin, [...py.args, ...args], {
+            cwd: this.app.vault.adapter.basePath,
+            env: { ...process.env, OBSIDIAN_VAULT_PATH: this.app.vault.adapter.basePath },
+            shell: py.shell,
+          });
+          let out = "";
+          let err = "";
+          proc.stdout.on("data", (d: Buffer) => { out += d.toString(); });
+          proc.stderr.on("data", (d: Buffer) => { err += d.toString(); });
+          proc.on("error", (e: Error) => reject(e));
+          proc.on("close", (c: number | null) => resolve({ code: c ?? -1, stdout: out, stderr: err }));
+        },
+      );
+      code = result2.code;
+      stdout = result2.stdout;
+      stderr = result2.stderr;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      new Notice(`Spawn failed: ${msg}`, 10000);
+      await appendFailureLog(
+        this.app,
+        this.manifest,
+        "create-project-from-selection",
+        `spawn failed: ${msg}`,
+      );
+      return;
+    }
+
+    if (code !== 0) {
+      const tail = (stderr || stdout).slice(-800);
+      new Notice(`init-project.py exited ${code}: ${tail}`, 12000);
+      await appendFailureLog(
+        this.app,
+        this.manifest,
+        "create-project-from-selection",
+        `exit ${code}: ${tail}`,
+      );
+      return;
+    }
+
+    // Try to open the new project's index note.
+    const indexPath = `${destDir}/${result.name}.md`;
+    const indexFile = this.app.vault.getAbstractFileByPath(indexPath);
+    if (indexFile instanceof TFile) {
+      await this.app.workspace.getLeaf(false).openFile(indexFile);
+      new Notice(`Created ${destDir}`);
+    } else {
+      new Notice(`Scaffold succeeded but couldn't find ${indexPath} — check the folder manually.`);
+    }
+  }
+
+  // Move a file under <archiveRoot>/ mirroring its source path. Adds (or
+  // updates) `archivedAt` in the YAML frontmatter before the move. Skips
+  // files that already live under archiveRoot. Uses fileManager.renameFile
+  // (atomic, Obsidian Sync-safe).
+  async moveToArchive(file: TFile): Promise<void> {
+    if (file.path.startsWith(this.settings.archiveRoot + "/")) {
+      new Notice(`Already in ${this.settings.archiveRoot}: ${file.path}`);
+      return;
+    }
+    const destPath = `${this.settings.archiveRoot}/${file.path}`;
+    const destExists = this.app.vault.getAbstractFileByPath(destPath);
+    if (destExists) {
+      new Notice(`Archive destination already exists: ${destPath}`);
+      return;
+    }
+
+    // 1. Read current content, add archivedAt to frontmatter
+    const raw = await this.app.vault.read(file);
+    const updated = this.injectArchivedAt(raw);
+    if (updated !== raw) {
+      await this.app.vault.modify(file, updated);
+    }
+
+    // 2. Ensure parent dir exists, then rename
+    const parentDir = destPath.includes("/")
+      ? destPath.slice(0, destPath.lastIndexOf("/"))
+      : "";
+    if (parentDir && !(await this.app.vault.adapter.exists(parentDir))) {
+      await this.app.vault.adapter.mkdir(parentDir);
+    }
+    try {
+      await this.app.fileManager.renameFile(file, destPath);
+      new Notice(`Archived → ${destPath}`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      new Notice(`Archive failed: ${msg}`, 8000);
+    }
+  }
+
+  // Insert (or replace) `archivedAt: <ISO>` in YAML frontmatter. If there is
+  // no frontmatter, prepend one. Returns the (possibly) modified text.
+  private injectArchivedAt(raw: string): string {
+    const ts = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+    const line = `archivedAt: ${ts}`;
+    // Match the frontmatter block but DO NOT consume the trailing newline —
+    // we want to preserve the blank-line separator between frontmatter and
+    // body content.
+    const fmMatch = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    if (!fmMatch) {
+      return `---\n${line}\n---\n\n${raw}`;
+    }
+    const body = fmMatch[1];
+    const rest = raw.slice(fmMatch[0].length);
+    if (/^archivedAt\s*:/m.test(body)) {
+      const replaced = body.replace(/^archivedAt\s*:.*$/m, line);
+      return `---\n${replaced}\n---${rest}`;
+    }
+    const trimmed = body.endsWith("\n") ? body.slice(0, -1) : body;
+    return `---\n${trimmed}\n${line}\n---${rest}`;
   }
 
   // Generate the default template body for a slot and write it to
@@ -1148,6 +1499,103 @@ class KusterInboxSettingTab extends PluginSettingTab {
       );
 
     // ---------------------------------------------------------------------
+    // Cron (automatic inbox processing)
+    // ---------------------------------------------------------------------
+    containerEl.createEl("h3", { text: "Cron (automatic processing)" });
+    containerEl.createEl("p", {
+      text:
+        "Off by default. When enabled, the plugin processes the inbox every N minutes. " +
+        "Notices are suppressed during cron runs (failures still go to the failure log). " +
+        "Reload Obsidian after changing these settings.",
+      cls: "setting-item-description",
+    });
+    new Setting(containerEl)
+      .setName("Enable cron")
+      .addToggle((tg) =>
+        tg
+          .setValue(this.plugin.settings.cronEnabled)
+          .onChange(async (v) => {
+            this.plugin.settings.cronEnabled = v;
+            await this.plugin.saveData(this.plugin.settings);
+          }),
+      );
+    new Setting(containerEl)
+      .setName("Interval (minutes)")
+      .addText((t) =>
+        t
+          .setValue(String(this.plugin.settings.cronIntervalMinutes))
+          .onChange(async (v) => {
+            const n = parseInt(v, 10);
+            this.plugin.settings.cronIntervalMinutes = Number.isFinite(n) && n > 0 ? n : 15;
+            await this.plugin.saveData(this.plugin.settings);
+          }),
+      );
+    new Setting(containerEl)
+      .setName("Run on startup")
+      .setDesc("Fire a processInbox immediately when Obsidian loads with cron enabled.")
+      .addToggle((tg) =>
+        tg
+          .setValue(this.plugin.settings.cronRunOnStartup)
+          .onChange(async (v) => {
+            this.plugin.settings.cronRunOnStartup = v;
+            await this.plugin.saveData(this.plugin.settings);
+          }),
+      );
+
+    // ---------------------------------------------------------------------
+    // Archive (move-to-archive command)
+    // ---------------------------------------------------------------------
+    containerEl.createEl("h3", { text: "Archive" });
+    containerEl.createEl("p", {
+      text:
+        "The 'Move to archive' right-click command mirrors the source path under this root. " +
+        "Example: 1. Projects/Homelab Manager/Plan.md → 4. Archive/1. Projects/Homelab Manager/Plan.md. " +
+        "Adds an `archivedAt` ISO timestamp to the note's frontmatter.",
+      cls: "setting-item-description",
+    });
+    new Setting(containerEl)
+      .setName("Archive root")
+      .addText((t) =>
+        t
+          .setValue(this.plugin.settings.archiveRoot)
+          .onChange(async (v) => {
+            this.plugin.settings.archiveRoot = v.trim() || "4. Archive";
+            await this.plugin.saveData(this.plugin.settings);
+          }),
+      );
+
+    // ---------------------------------------------------------------------
+    // Project scaffold
+    // ---------------------------------------------------------------------
+    containerEl.createEl("h3", { text: "Project scaffold" });
+    containerEl.createEl("p", {
+      text:
+        "Used by 'Create project from selection'. The command reads numbered subfolders under " +
+        "the projects root live, asks which type + name, then shells out to init-project.py.",
+      cls: "setting-item-description",
+    });
+    new Setting(containerEl)
+      .setName("Projects root")
+      .addText((t) =>
+        t
+          .setValue(this.plugin.settings.projectsRoot)
+          .onChange(async (v) => {
+            this.plugin.settings.projectsRoot = v.trim() || "1. Projects";
+            await this.plugin.saveData(this.plugin.settings);
+          }),
+      );
+    new Setting(containerEl)
+      .setName("init-project.py path (vault-relative)")
+      .addText((t) =>
+        t
+          .setValue(this.plugin.settings.templateScriptPath)
+          .onChange(async (v) => {
+            this.plugin.settings.templateScriptPath = v.trim();
+            await this.plugin.saveData(this.plugin.settings);
+          }),
+      );
+
+    // ---------------------------------------------------------------------
     // Failure log (lives outside the vault, in the OS app-data dir)
     // ---------------------------------------------------------------------
     containerEl.createEl("h3", { text: "Failure log" });
@@ -1332,6 +1780,180 @@ class DuplicateNoteModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
   }
+}
+
+// ============================================================================
+// Project-scaffold modal (Create project from selection)
+// ============================================================================
+
+interface ProjectTypeOption {
+  label: string;       // displayed
+  value: string;       // folder name, e.g. "3. Coding"
+  absPath: string;     // absolute path on disk for the scaffold destination
+}
+
+interface ProjectScaffoldResult {
+  typeValue: string;
+  name: string;
+  key: string;
+  initialPlan: string;
+}
+
+// Asks for project type (dropdown of <projectsRoot>/<Type>/ subfolders),
+// project name, and shows the derived key. Optional initial-plan content
+// from the inbox selection is passed through to the Python script.
+class ProjectScaffoldModal extends Modal {
+  private app: App;
+  private types: ProjectTypeOption[];
+  private projectsRoot: string;        // vault-relative, default "1. Projects"
+  private templateScriptPath: string;  // vault-relative path to init-project.py
+  private initialPlan: string;
+  private selectedTypeIdx = 0;
+  private onDone: (r: ProjectScaffoldResult | null) => void;
+
+  constructor(
+    app: App,
+    opts: {
+      types: ProjectTypeOption[];
+      projectsRoot: string;
+      templateScriptPath: string;
+      initialPlan: string;
+      onDone: (r: ProjectScaffoldResult | null) => void;
+    },
+  ) {
+    super(app);
+    this.app = app;
+    this.types = opts.types;
+    this.projectsRoot = opts.projectsRoot;
+    this.templateScriptPath = opts.templateScriptPath;
+    this.initialPlan = opts.initialPlan;
+    this.onDone = opts.onDone;
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Create project from selection" });
+
+    if (this.types.length === 0) {
+      contentEl.createEl("p", {
+        text: `No project-type subfolders found under "${this.projectsRoot}/". Create at least one (e.g. "1. Coding", "2. Personal", etc.) and try again.`,
+      });
+      const closeBtn = contentEl.createEl("button", { text: "Close" });
+      closeBtn.addEventListener("click", () => {
+        this.close();
+        this.onDone(null);
+      });
+      return;
+    }
+
+    // Project type dropdown
+    const typeSetting = new Setting(contentEl)
+      .setName("Project type")
+      .setDesc("Subfolders of " + this.projectsRoot + "/ — read live from vault.");
+    const typeSelect = typeSetting.controlEl.createEl("select");
+    this.types.forEach((t, idx) => {
+      const opt = typeSelect.createEl("option", { text: t.label, value: String(idx) });
+      if (idx === this.selectedTypeIdx) opt.selected = true;
+    });
+    typeSelect.addEventListener("change", () => {
+      this.selectedTypeIdx = parseInt(typeSelect.value, 10) || 0;
+    });
+
+    // Project name + derived key
+    const nameSetting = new Setting(contentEl).setName("Project name");
+    let nameValue = "";
+    let keyValue = "";
+    nameSetting.addText((t) => {
+      t.setPlaceholder("My New Project").onChange((v) => {
+        nameValue = v;
+        keyValue = deriveProjectKey(v);
+        keyInput.value = keyValue;
+        previewEl.setText(this.previewPath());
+      });
+    });
+    const keySetting = new Setting(contentEl)
+      .setName("Project key")
+      .setDesc("Auto-derived from name (^[A-Z][A-Z0-9-]{1,15}$). Edit if you want.");
+    const keyInput = keySetting.controlEl.createEl("input", {
+      type: "text",
+      attr: { value: "" },
+    });
+    keyInput.style.width = "100%";
+    keyInput.addEventListener("change", () => {
+      keyValue = keyInput.value;
+    });
+
+    // Preview + buttons
+    const previewEl = contentEl.createEl("p");
+    previewEl.style.cssText =
+      "font-family: var(--font-monospace); font-size: 12px; padding: 6px 8px; background: var(--background-secondary); border-radius: 4px; margin-top: 8px;";
+    previewEl.setText(this.previewPath());
+
+    const initialNote = contentEl.createEl("p", {
+      text:
+        this.initialPlan.length > 0
+          ? `Selected text (${this.initialPlan.length} chars) will seed the v0.1 plan.`
+          : "No text was selected in the inbox. The new project's plan will start empty.",
+      cls: "setting-item-description",
+    });
+
+    const buttons = contentEl.createDiv({ attr: { style: "display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px;" } });
+    const cancel = buttons.createEl("button", { text: "Cancel" });
+    cancel.addEventListener("click", () => {
+      this.close();
+      this.onDone(null);
+    });
+    const create = buttons.createEl("button", { text: "Create project" });
+    create.addEventListener("click", () => {
+      const t = this.types[this.selectedTypeIdx];
+      if (!nameValue.trim()) {
+        new Notice("Project name is required");
+        return;
+      }
+      if (!/^[A-Z][A-Z0-9-]{1,15}$/.test(keyValue)) {
+        new Notice("Project key must match ^[A-Z][A-Z0-9-]{1,15}$");
+        return;
+      }
+      this.close();
+      this.onDone({
+        typeValue: t.value,
+        name: nameValue.trim(),
+        key: keyValue,
+        initialPlan: this.initialPlan,
+      });
+    });
+
+    // Focus name field
+    setTimeout(() => {
+      const input = nameSetting.controlEl.querySelector("input[type='text']") as HTMLInputElement | null;
+      input?.focus();
+    }, 0);
+  }
+
+  onClose(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+  }
+
+  private previewPath(): string {
+    const t = this.types[this.selectedTypeIdx];
+    if (!t) return "(select a project type)";
+    return `${this.projectsRoot}/${t.value}/<name>/`;
+  }
+}
+
+function deriveProjectKey(name: string): string {
+  return name
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 16);
+}
+
+function formatHm(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 // ============================================================================
@@ -1558,6 +2180,60 @@ async function readFailureLog(app: App, manifestDir: string): Promise<string | n
   const logPath = `${dir}/process-failures.log`;
   if (!(await app.vault.adapter.exists(logPath))) return null;
   return await app.vault.adapter.read(logPath);
+}
+
+// ============================================================================
+// Python detection for the project-scaffold command
+// ============================================================================
+
+interface PythonInvoker {
+  bin: string;   // the binary name to run
+  args: string[]; // optional fixed args before the script (e.g. ["-3"] for `py -3`)
+  shell: boolean; // whether to spawn via shell (true on Windows for `.exe` lookup)
+}
+
+// Try the common Python invokers in order. Returns the first one whose
+// `bin --version` exits 0. Cached per plugin session — process spawn is
+// expensive (50–200ms each).
+let pythonCache: PythonInvoker | null = null;
+async function findPython(): Promise<PythonInvoker | null> {
+  if (pythonCache) return pythonCache;
+  const candidates: PythonInvoker[] = process.platform === "win32"
+    ? [
+        { bin: "py", args: ["-3"], shell: true },
+        { bin: "python", args: [], shell: true },
+        { bin: "python3", args: [], shell: true },
+      ]
+    : [
+        { bin: "python3", args: [], shell: false },
+        { bin: "python", args: [], shell: false },
+      ];
+  for (const c of candidates) {
+    try {
+      const ok = await new Promise<boolean>((resolve) => {
+        // @ts-ignore — require available in Electron renderer with nodeIntegration
+        const cp = require("child_process");
+        const proc = cp.spawn(c.bin, [...c.args, "--version"], {
+          shell: c.shell,
+          windowsHide: true,
+        });
+        proc.on("error", () => resolve(false));
+        proc.on("close", (code: number | null) => resolve(code === 0));
+        // 3-second timeout so a hung PATH lookup doesn't block forever.
+        setTimeout(() => {
+          try { proc.kill(); } catch { /* */ }
+          resolve(false);
+        }, 3000);
+      });
+      if (ok) {
+        pythonCache = c;
+        return c;
+      }
+    } catch {
+      // try next
+    }
+  }
+  return null;
 }
 
 function seedClaudeContext(): string {

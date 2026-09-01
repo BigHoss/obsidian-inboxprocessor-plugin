@@ -1,6 +1,6 @@
 {
   "name": "obsidian-inboxprocessor-plugin",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Processes iOS-shared links from 0. Inbox/0. Inbox.md into templated notes.",
   "main": "main.js",
   "scripts": {
