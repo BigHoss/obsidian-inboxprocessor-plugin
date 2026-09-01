@@ -1,0 +1,8 @@
+/* Kuster Inbox Processor — status-bar polish */
+.status-bar-item.kuster-inbox-pending {
+  color: var(--text-accent);
+  font-weight: 600;
+}
+.status-bar-item.kuster-inbox-clean {
+  color: var(--text-muted);
+}
