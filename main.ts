@@ -17,8 +17,10 @@ import {
   ButtonComponent,
   Editor,
   MarkdownView,
+  Menu,
   Modal,
   Notice,
+  Platform,
   Plugin,
   PluginSettingTab,
   requestUrl,
@@ -60,11 +62,11 @@ interface KusterInboxSettings {
   // Allowed root for LLM-suggested destinations. Anything outside fails closed
   // to the per-template defaultDestination. Paths are vault-relative.
   allowedDestinationRoots: string[];
-  fetchTimeoutSeconds: number;
   maxLinksPerRun: number;
   notifyOnError: boolean;
   notifyUrl: string;
-  userAgent: string;
+  // Show a per-link "Fetching via LLM…" notice while the LLM is processing.
+  showFetchNotices: boolean;
 }
 
 const DEFAULT_SETTINGS: KusterInboxSettings = {
@@ -104,11 +106,10 @@ const DEFAULT_SETTINGS: KusterInboxSettings = {
     "3. Resources",
     "4. Archive",
   ],
-  fetchTimeoutSeconds: 10,
   maxLinksPerRun: 50,
   notifyOnError: false,
   notifyUrl: "",
-  userAgent: "Mozilla/5.0 (Link-InboxProcessor/0.2)",
+  showFetchNotices: true,
 };
 
 // ============================================================================
@@ -121,18 +122,16 @@ interface ParsedLine {
   raw: string;
 }
 
-interface FetchedMeta {
-  title: string;
-  description: string;
-  image: string;
-  siteName: string;
-}
-
+// The LLM does all fetching (it has its own web-fetch / browser tools via
+// OpenRouter). We pass the URL and let the model read the page itself. The
+// response includes everything we used to scrape out of og:tags.
 interface LlmEnrichment {
   refinedTitle: string;
   suggestedDestination: string;
   suggestedTags: string[];
-  linkType: string; // one of the configured TemplateSlot.linkType values
+  linkType: string;          // one of the configured TemplateSlot.linkType values
+  description: string;       // short summary the LLM read off the page
+  siteName: string;          // publisher / domain the LLM read off the page
 }
 
 // Read the CLAUDE.md context file if it exists. Returns empty string if not
@@ -210,75 +209,14 @@ function nowStamp(): string {
 }
 
 // ============================================================================
-// HTML meta extraction (no DOM parser dependency)
-// ============================================================================
-
-function decodeEntities(s: string): string {
-  return s
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&#(\d+);/g, (_m, n) => {
-      try {
-        return String.fromCodePoint(parseInt(n, 10));
-      } catch {
-        return _m;
-      }
-    });
-}
-
-function matchMeta(html: string, attr: string, value: string): string | null {
-  // matches <meta property="og:X" content="..."> in any order of attributes
-  const re = new RegExp(
-    `<meta[^>]+${attr}=["']${value}["'][^>]+content=["']([^"']+)["']`,
-    "i",
-  );
-  const m = html.match(re);
-  if (m) return decodeEntities(m[1]);
-  // try the reverse attribute order
-  const re2 = new RegExp(
-    `<meta[^>]+content=["']([^"']+)["'][^>]+${attr}=["']${value}["']`,
-    "i",
-  );
-  const m2 = html.match(re2);
-  return m2 ? decodeEntities(m2[1]) : null;
-}
-
-function extractMeta(html: string): FetchedMeta {
-  const title =
-    matchMeta(html, "property", "og:title") ??
-    matchMeta(html, "name", "twitter:title") ??
-    html.match(/<title>([^<]+)<\/title>/i)?.[1]?.trim() ??
-    "";
-  const description =
-    matchMeta(html, "property", "og:description") ??
-    matchMeta(html, "name", "description") ??
-    "";
-  const image =
-    matchMeta(html, "property", "og:image") ??
-    matchMeta(html, "name", "twitter:image") ??
-    "";
-  const siteName = matchMeta(html, "property", "og:site_name") ?? "";
-  return {
-    title: decodeEntities(title),
-    description: decodeEntities(description),
-    image: decodeEntities(image),
-    siteName: decodeEntities(siteName),
-  };
-}
-
-// ============================================================================
-// Hermes LLM enrichment (optional)
+// OpenRouter LLM enrichment — the LLM does all page fetching via its own
+// web-search / browser tool. We never call requestUrl on the destination URL.
 // ============================================================================
 
 async function enrichWithLlm(
   app: App,
   settings: KusterInboxSettings,
   url: string,
-  meta: FetchedMeta,
 ): Promise<LlmEnrichment | null> {
   if (!settings.llmEnabled || !settings.openrouterApiKey) return null;
 
@@ -302,15 +240,20 @@ async function enrichWithLlm(
     (claudeContext
       ? `## User's classification context (from 0. Inbox/CLAUDE.md)\n\n${claudeContext}\n\n`
       : "") +
+    `## Page fetching\n` +
+    `Use your web-fetch / web-search / browser tool to read the URL yourself. If your tool surface does\n` +
+    `not include a fetch capability, fall back to whatever you can infer from the URL alone (domain +\n` +
+    `path) and set description / siteName to empty strings.\n\n` +
     `Return ONLY a JSON object with these fields:\n` +
-    `- refinedTitle: 3-7 words, Title Case, human-readable\n` +
+    `- refinedTitle: 3-7 words, Title Case, human-readable (use the page's H1 or <title> if you fetched it)\n` +
     `- linkType: one of the link-type strings above (e.g. "link", "media", "task")\n` +
     `- suggestedDestination: vault-relative path under one of the allowed roots, e.g. "3. Resources/AI" or "0. Inbox/Tasks"\n` +
-    `- suggestedTags: array of 2-5 lower-case tags\n\n` +
+    `- suggestedTags: array of 2-5 lower-case tags\n` +
+    `- description: 1-2 sentence summary of what the page is about (empty string if you could not fetch)\n` +
+    `- siteName: the publisher / domain (e.g. "github.com", empty string if you could not fetch)\n\n` +
     `No prose, no code fences.`;
 
-  const userPrompt =
-    `URL: ${url}\nog:title: ${meta.title}\nog:description: ${meta.description}\nog:site_name: ${meta.siteName}`;
+  const userPrompt = `URL: ${url}`;
 
   try {
     const headers: Record<string, string> = {
@@ -335,10 +278,14 @@ async function enrichWithLlm(
       throw: false,
     };
     const r = await requestUrl(body);
-    if (r.status < 200 || r.status >= 300) return null;
+    if (r.status < 200 || r.status >= 300) {
+      throw new Error(`OpenRouter HTTP ${r.status}`);
+    }
     const text = r.json?.choices?.[0]?.message?.content ?? "";
     const json = text.match(/\{[\s\S]*\}/)?.[0];
-    if (!json) return null;
+    if (!json) {
+      throw new Error("LLM returned no JSON in response");
+    }
     const parsed = JSON.parse(json);
 
     // Resolve linkType against configured slots
@@ -355,7 +302,7 @@ async function enrichWithLlm(
       : slot.defaultDestination;
 
     return {
-      refinedTitle: String(parsed.refinedTitle ?? meta.title ?? "Untitled").trim(),
+      refinedTitle: String(parsed.refinedTitle ?? parsed.title ?? "Untitled").trim(),
       suggestedDestination: safeDest,
       suggestedTags: Array.isArray(parsed.suggestedTags)
         ? parsed.suggestedTags
@@ -363,9 +310,12 @@ async function enrichWithLlm(
             .filter(Boolean)
         : [],
       linkType: slot.linkType,
+      description: String(parsed.description ?? "").trim(),
+      siteName: String(parsed.siteName ?? "").trim(),
     };
-  } catch {
-    return null;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`LLM enrichment failed: ${msg}`);
   }
 }
 
@@ -377,12 +327,11 @@ function renderNote(
   template: string,
   title: string,
   url: string,
-  meta: FetchedMeta,
   llm: LlmEnrichment | null,
   stamp: string,
   destination: string,
 ): string {
-  const finalTitle = llm?.refinedTitle ?? meta.title ?? title ?? "Untitled Link";
+  const finalTitle = llm?.refinedTitle ?? title ?? "Untitled Link";
   const tags = llm?.suggestedTags ?? [];
 
   // Build all the {{date:...}} placeholders the templates use.
@@ -476,9 +425,61 @@ export default class KusterInboxPlugin extends Plugin {
 
     this.addSettingTab(new KusterInboxSettingTab(this.app, this));
 
-    // Status bar — pending count
+    // Status bar — pending count, with a right-click context menu
     this.statusBarEl = this.addStatusBarItem();
     this.statusBarEl.setText("Inbox: …");
+    this.statusBarEl.addEventListener("contextmenu", (e) => {
+      const ev = e as MouseEvent;
+      ev.preventDefault();
+      const menu = new Menu();
+      menu.addItem((item) =>
+        item
+          .setTitle("Process inbox now")
+          .setIcon("inbox")
+          .onClick(() => this.processInbox()),
+      );
+      menu.addItem((item) =>
+        item
+          .setTitle("Open inbox file")
+          .setIcon("file-text")
+          .onClick(async () => {
+            const f = this.resolveFile(this.settings.inboxFile);
+            if (f) await this.app.workspace.getLeaf(false).openFile(f);
+            else new Notice("Inbox file not found");
+          }),
+      );
+      menu.addItem((item) =>
+        item
+          .setTitle("Refresh pending count")
+          .setIcon("refresh-cw")
+          .onClick(() => this.refreshStatusBar()),
+      );
+      menu.addSeparator();
+      menu.addItem((item) =>
+        item
+          .setTitle("View failure log")
+          .setIcon("file-warning")
+          .onClick(async () => {
+            const text = await readFailureLog(this.app, this.manifest.dir);
+            if (text === null) {
+              new Notice("No failures recorded yet");
+              return;
+            }
+            const dir = await pluginDataDir(this.app, this.manifest.dir);
+            await this.app.workspace.openLinkText(`${dir}/process-failures.log`, "", false);
+          }),
+      );
+      menu.addItem((item) =>
+        item
+          .setTitle("Clear failure log")
+          .setIcon("trash")
+          .onClick(async () => {
+            const cleared = await clearFailureLog(this.app, this.manifest.dir);
+            new Notice(cleared ? "Failure log cleared" : "Nothing to clear");
+          }),
+      );
+      menu.showAtMouseEvent(ev);
+    });
     this.app.workspace.onLayoutReady(() => this.refreshStatusBar());
 
     this.registerEvent(
@@ -574,7 +575,10 @@ export default class KusterInboxPlugin extends Plugin {
         continue;
       }
       try {
-        const result = await this.processOne(parsed, templatesByType, defaultTemplate);
+        const onProgress = this.settings.showFetchNotices
+          ? (msg: string) => new Notice(`Inbox: ${i + 1}/${cap} — ${msg}`, 3000)
+          : undefined;
+        const result = await this.processOne(parsed, templatesByType, defaultTemplate, onProgress);
         if (result === null) {
           // user chose Skip — link stays in inbox for next run
           survivors.push(line);
@@ -591,9 +595,10 @@ export default class KusterInboxPlugin extends Plugin {
         }
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        new Notice(`✗ ${parsed.url} — ${msg}`);
+        new Notice(`✗ ${parsed.url} — ${msg}`, 8000);
         survivors.push(line);
         failCount++;
+        await appendFailureLog(this.app, this.manifest, parsed.url, msg);
         await notifyError(this.settings, `Failed: ${parsed.url}\n${msg}`);
       }
     }
@@ -629,7 +634,10 @@ export default class KusterInboxPlugin extends Plugin {
       ? await this.app.vault.read(defaultTemplateFile)
       : DEFAULT_TEMPLATE;
     try {
-      const result = await this.processOne(parsed, templatesByType, defaultTemplate);
+      const onProgress = this.settings.showFetchNotices
+        ? (msg: string) => new Notice(msg, 3000)
+        : undefined;
+      const result = await this.processOne(parsed, templatesByType, defaultTemplate, onProgress);
       if (result === null) {
         new Notice("Skipped duplicate");
       } else if (typeof result === "object" && "abort" in result) {
@@ -640,7 +648,8 @@ export default class KusterInboxPlugin extends Plugin {
       this.refreshStatusBar();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      new Notice(`✗ ${parsed.url} — ${msg}`);
+      new Notice(`✗ ${parsed.url} — ${msg}`, 8000);
+      await appendFailureLog(this.app, this.manifest, parsed.url, msg);
     }
   }
 
@@ -648,40 +657,31 @@ export default class KusterInboxPlugin extends Plugin {
     parsed: ParsedLine,
     templatesByType: Map<string, string>,
     defaultTemplate: string,
+    onProgress?: (msg: string) => void,
   ): Promise<string | null | { abort: true }> {
-    // 1. Fetch metadata
-    const r = await requestUrl({
-      url: parsed.url,
-      method: "GET",
-      headers: { "User-Agent": this.settings.userAgent },
-      throw: false,
-    });
-    if (r.status < 200 || r.status >= 300) {
-      throw new Error(`HTTP ${r.status}`);
-    }
-    const meta = extractMeta(r.text);
+    // 1. Optional LLM enrichment — the LLM fetches the URL itself via its
+    // web-fetch / browser tool. We never call requestUrl on the destination.
+    onProgress?.(`Fetching ${parsed.url} via LLM…`);
+    const llm = await enrichWithLlm(this.app, this.settings, parsed.url);
 
-    // 2. Optional LLM enrichment (now classifies linkType + validates destination)
-    const llm = await enrichWithLlm(this.app, this.settings, parsed.url, meta);
-
-    // 3. Pick template + destination
+    // 2. Pick template + destination
     const slot =
       this.settings.templates.find((t) => t.linkType === (llm?.linkType ?? "")) ??
       this.settings.templates[0];
     const template = templatesByType.get(slot.linkType) ?? defaultTemplate;
     const destinationDir = (llm?.suggestedDestination || slot.defaultDestination).trim();
 
-    // 4. Compose title + filename
-    const baseTitle = parsed.title ?? meta.title ?? parsed.url;
+    // 3. Compose title + filename
+    const baseTitle = parsed.title ?? parsed.url;
     const finalTitle = sanitizeFilename(llm?.refinedTitle ?? baseTitle);
     const stamp = nowStamp();
     const filename = `${stamp} - ${finalTitle || "Untitled Link"}.md`;
     const notePath = `${destinationDir}/${filename}`;
 
-    // 5. Render
-    const body = renderNote(template, baseTitle, parsed.url, meta, llm, stamp, destinationDir);
+    // 4. Render
+    const body = renderNote(template, baseTitle, parsed.url, llm, stamp, destinationDir);
 
-    // 6. Resolve filename collisions against existing files. Obsidian's
+    // 5. Resolve filename collisions against existing files. Obsidian's
     // vault.create throws "File already exists" if the path is taken; we
     // want to give the user a real choice instead of failing the batch.
     const resolution = await this.resolveCollision(notePath, parsed.url);
@@ -1134,18 +1134,82 @@ class KusterInboxSettingTab extends PluginSettingTab {
           }),
       );
     new Setting(containerEl)
-      .setName("Fetch timeout (seconds)")
-      .addText((t) =>
-        t
-          .setValue(String(this.plugin.settings.fetchTimeoutSeconds))
+      .setName("Show per-link fetch notices")
+      .setDesc(
+        "When enabled, a short Notice appears for each link as the LLM fetches it (e.g. 'Inbox: 3/22 — Fetching https://… via LLM…').",
+      )
+      .addToggle((tg) =>
+        tg
+          .setValue(this.plugin.settings.showFetchNotices)
           .onChange(async (v) => {
-            const n = parseInt(v, 10);
-            this.plugin.settings.fetchTimeoutSeconds = Number.isFinite(n)
-              ? n
-              : 10;
+            this.plugin.settings.showFetchNotices = v;
             await this.plugin.saveData(this.plugin.settings);
           }),
       );
+
+    // ---------------------------------------------------------------------
+    // Failure log (lives outside the vault, in the OS app-data dir)
+    // ---------------------------------------------------------------------
+    containerEl.createEl("h3", { text: "Failure log" });
+    containerEl.createEl("p", {
+      text:
+        "Per-link failures are appended to a log file outside the vault. " +
+        "Use the buttons below to view or clear it. The path is shown at the bottom.",
+      cls: "setting-item-description",
+    });
+    new Setting(containerEl)
+      .setName("View failure log")
+      .setDesc("Opens the log in Obsidian if it has any entries.")
+      .addButton((b) =>
+        b.setButtonText("View").onClick(async () => {
+          const text = await readFailureLog(
+            this.plugin.app,
+            this.plugin.manifest.dir,
+          );
+          if (text === null) {
+            new Notice("No failures recorded yet");
+            return;
+          }
+          const dir = await pluginDataDir(
+            this.plugin.app,
+            this.plugin.manifest.dir,
+          );
+          const logPath = `${dir}/process-failures.log`;
+          await this.plugin.app.workspace.openLinkText(logPath, "", false);
+        }),
+      )
+      .addButton((b) =>
+        b
+          .setButtonText("Clear")
+          .setWarning()
+          .onClick(async () => {
+            const cleared = await clearFailureLog(
+              this.plugin.app,
+              this.plugin.manifest.dir,
+            );
+            new Notice(cleared ? "Failure log cleared" : "Nothing to clear");
+          }),
+      );
+    const pathSetting = new Setting(containerEl)
+      .setName("Log file location")
+      .setDesc("Computed at runtime — shown for reference.");
+    pathSetting.descEl.createEl("code", {
+      text: "(populated when first failure occurs)",
+    });
+    (async () => {
+      try {
+        const dir = await pluginDataDir(
+          this.plugin.app,
+          this.plugin.manifest.dir,
+        );
+        pathSetting.descEl.empty();
+        pathSetting.descEl.createEl("code", {
+          text: `${dir}/process-failures.log`,
+        });
+      } catch {
+        // best-effort
+      }
+    })();
 
     // ---------------------------------------------------------------------
     // Notifications
@@ -1423,6 +1487,78 @@ URL: {{url}}
 **Captured:** {{date:YYYY-MM-DD HH:mm}}
 `,
 };
+
+// ============================================================================
+// Plugin-private data dir (failure log lives here, outside the vault)
+// ============================================================================
+
+// Cross-platform plugin data directory. Lives outside the vault so it never
+// gets synced. On desktop we use the OS-standard app-data location; on mobile
+// (iOS / Android) we fall back to the plugin's own folder inside the vault
+// because there's no OS-level app-data dir accessible from a sandboxed plugin.
+//
+//   Windows: %APPDATA%\Link Inbox Processor\
+//   macOS:   ~/Library/Application Support/Link Inbox Processor/
+//   Linux:   $XDG_CONFIG_HOME/Link Inbox Processor/  (or ~/.config/...)
+//   iOS/Android: <vault>/.obsidian/plugins/kuster-inbox-processor/state/
+//
+// Returned directory is created if it doesn't exist.
+import * as os from "os";
+import * as path from "path";
+
+async function pluginDataDir(app: App, manifestDir: string): Promise<string> {
+  const isMobile = Platform.isMobile === true;
+  let base: string;
+  if (isMobile) {
+    base = manifestDir; // sandboxed inside vault — file is harmless to sync
+  } else if (process.platform === "win32") {
+    base = `${process.env.APPDATA ?? path.join(os.homedir(), "AppData", "Roaming")}/Link Inbox Processor`;
+  } else if (process.platform === "darwin") {
+    base = `${process.env.HOME ?? os.homedir()}/Library/Application Support/Link Inbox Processor`;
+  } else {
+    const xdg = process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), ".config");
+    base = `${xdg}/Link Inbox Processor`;
+  }
+  await app.vault.adapter.mkdir(base).catch(() => undefined);
+  return base;
+}
+
+async function appendFailureLog(
+  app: App,
+  manifest: { dir: string },
+  url: string,
+  errorMessage: string,
+): Promise<void> {
+  try {
+    const dir = await pluginDataDir(app, manifest.dir);
+    const logPath = `${dir}/process-failures.log`;
+    const ts = new Date().toISOString();
+    const line = `${ts} | ${url} | ${errorMessage.replace(/\n/g, " ").trim()}\n`;
+    const existing = (await app.vault.adapter.exists(logPath))
+      ? await app.vault.adapter.read(logPath)
+      : "";
+    await app.vault.adapter.write(logPath, existing + line);
+  } catch {
+    // Don't let logging failures break the main flow.
+  }
+}
+
+async function clearFailureLog(app: App, manifestDir: string): Promise<boolean> {
+  const dir = await pluginDataDir(app, manifestDir);
+  const logPath = `${dir}/process-failures.log`;
+  if (await app.vault.adapter.exists(logPath)) {
+    await app.vault.adapter.remove(logPath);
+    return true;
+  }
+  return false;
+}
+
+async function readFailureLog(app: App, manifestDir: string): Promise<string | null> {
+  const dir = await pluginDataDir(app, manifestDir);
+  const logPath = `${dir}/process-failures.log`;
+  if (!(await app.vault.adapter.exists(logPath))) return null;
+  return await app.vault.adapter.read(logPath);
+}
 
 function seedClaudeContext(): string {
   return `# Inbox Processor — Classification Context

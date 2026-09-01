@@ -7,13 +7,14 @@ An Obsidian plugin that turns iOS-shared links into templated vault notes for a 
 Reads the iOS Share-Target block at the bottom of `0. Inbox/0. Inbox.md` (delimited by the marker comment), and for each link:
 
 1. Parses `[title](url)` or bare URL
-2. Fetches the page → extracts `og:title`, `og:description`, `og:image`, `og:site_name`
-3. *(Optional, LLM enabled)* Asks OpenRouter for `linkType`, `suggestedDestination`, `refinedTitle`, `suggestedTags[]`
-4. Picks the template whose `linkType` matches (falls back to the default if LLM is off)
-5. Writes the note to the LLM-suggested destination (or the slot's default), e.g. `0. Inbox/Links/<stamp> - <Title>.md` or `3. Resources/AI/<stamp> - <Title>.md`
-6. Atomically removes only the successfully-processed lines from the inbox file
+2. *(Optional, LLM enabled)* Sends the URL to OpenRouter — the LLM fetches the page itself via its web-fetch / browser tool, classifies the link into a `linkType`, picks a PARA destination, and returns `{ refinedTitle, linkType, suggestedDestination, suggestedTags, description, siteName }`
+3. Picks the template whose `linkType` matches (falls back to the default if LLM is off)
+4. Writes the note to the LLM-suggested destination (or the slot's default), e.g. `0. Inbox/Links/<stamp> - <Title>.md` or `3. Resources/AI/<stamp> - <Title>.md`
+5. Atomically removes only the successfully-processed lines from the inbox file
 
-Failed lines are kept in the inbox for the next run — eventual progress, never a stuck state.
+Failed lines are kept in the inbox for the next run — eventual progress, never a stuck state. Every failure is also appended to an **out-of-vault log** so you can audit them later.
+
+**No more direct page fetching from Obsidian.** The plugin never calls `requestUrl` on the destination URL anymore — that dodges Cloudflare bot-protection (the 403 you used to see on `printables.com` etc.) because OpenRouter's providers have real browsers.
 
 ---
 
@@ -145,7 +146,16 @@ The **Create if missing** button writes a starter `CLAUDE.md` describing your PA
 | Field | Default |
 |---|---|
 | Max links per run | `50` |
-| Fetch timeout (s) | `10` |
+| Show per-link fetch notices | `true` |
+
+### Failure log
+Per-link failures are appended to a log file **outside the vault**:
+- Windows: `%APPDATA%\Link Inbox Processor\process-failures.log`
+- macOS: `~/Library/Application Support/Link Inbox Processor/process-failures.log`
+- Linux: `$XDG_CONFIG_HOME/Link Inbox Processor/process-failures.log`
+- Mobile: falls back to the plugin folder inside the vault
+
+Use the **View** / **Clear** buttons in the Failure log section of settings to open or wipe it. Right-click the status-bar item for the same options.
 
 ### Notifications
 | Field | Default |
@@ -174,7 +184,7 @@ This is the convention locked by [`ADR-001`](https://github.com/BigHoss/obsidian
 - **Process inbox links now** — `Ctrl+Shift+P` (default). Process every line below the marker.
 - **Process the link on the current line** — only the cursor's line.
 
-A status-bar item shows pending count: `Inbox: 22 pending` or `Inbox: clean`. A ribbon icon (inbox) does the same as the hotkey.
+A status-bar item shows pending count: `Inbox: 22 pending` or `Inbox: clean`. **Right-click it** for a context menu with: Process inbox now, Open inbox file, Refresh pending count, View failure log, Clear failure log. A ribbon icon (inbox) does the same as the hotkey.
 
 ---
 
