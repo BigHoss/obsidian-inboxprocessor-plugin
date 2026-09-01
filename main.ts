@@ -686,17 +686,18 @@ const DEFAULT_TEMPLATE = `---
 created: {{date:YYYYMMDDHHmmss}}
 updated: {{date:YYYYMMDDHHmmss}}
 status: "⏳ To Process"
-destination: 
-url: 
+destination:
+url:
 tags: []
 ---
 
 # {{title}}
 
-- [ ] {{title}} #inbox/pending
+- [ ] read #inbox/pending
+- [ ] processed #inbox/processed
 
 ## 🔗 Source
-URL: 
+URL:
 
 ## 📝 Context
 

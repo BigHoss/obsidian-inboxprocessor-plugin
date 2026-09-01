@@ -34,17 +34,18 @@ ${Y}`)}}for(let h=l;h<c.length;h++)y.push(c[h]);let g=y.length>0?`
 created: {{date:YYYYMMDDHHmmss}}
 updated: {{date:YYYYMMDDHHmmss}}
 status: "\u23F3 To Process"
-destination: 
-url: 
+destination:
+url:
 tags: []
 ---
 
 # {{title}}
 
-- [ ] {{title}} #inbox/pending
+- [ ] read #inbox/pending
+- [ ] processed #inbox/processed
 
 ## \u{1F517} Source
-URL: 
+URL:
 
 ## \u{1F4DD} Context
 
