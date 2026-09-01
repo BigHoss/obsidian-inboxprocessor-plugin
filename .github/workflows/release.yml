@@ -1,15 +1,19 @@
 name: Release
 
-# Trigger on tag push matching v* (e.g. v0.4.1).
-# Tag is pushed by scripts/release.ps1 or manually:
-#   git tag v0.4.1
-#   git push origin v0.4.1
-# This workflow builds the plugin and attaches main.js, manifest.json,
-# styles.css to a GitHub Release.
+# Trigger on push to main: when manifest.json's version has been bumped
+# (typically via scripts/release.ps1), this workflow creates the matching
+# git tag (vX.Y.Z) and a GitHub Release with main.js, manifest.json, and
+# styles.css attached.
+#
+# No manual tag management required: push main, action does the rest.
+#
+# Manual re-runs are also supported via the Actions tab → "Run workflow"
+# with a custom tag input (used for re-releasing after fixing a bad tag,
+# or publishing a tag from a non-main branch).
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       tag:
@@ -28,18 +32,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # Fetch full history so package-lock.json can be resolved.
           fetch-depth: 0
 
-      - name: Resolve tag
-        id: tag
+      - name: Read manifest version
+        id: version
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-          fi
-          echo "Resolved tag: ${{ steps.tag.outputs.tag }}"
+          VERSION=$(node -e "console.log(require('./manifest.json').version)")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Manifest version: $VERSION"
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -60,28 +60,46 @@ jobs:
           test -f styles.css || (echo "styles.css missing" && exit 1)
           echo "All three plugin assets present"
 
-      - name: Extract version from manifest
-        id: version
+      - name: Resolve target tag
+        id: target
         run: |
-          node -e "console.log('version=' + require('./manifest.json').version)" >> "$GITHUB_OUTPUT"
-
-      - name: Sanity check version matches tag
-        run: |
-          TAG_VERSION="${{ steps.tag.outputs.tag }}"
-          TAG_VERSION="${TAG_VERSION#v}"
-          MANIFEST_VERSION="${{ steps.version.outputs.version }}"
-          if [ "$TAG_VERSION" != "$MANIFEST_VERSION" ]; then
-            echo "Tag $TAG_VERSION does not match manifest version $MANIFEST_VERSION"
-            exit 1
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=v${{ steps.version.outputs.version }}" >> "$GITHUB_OUTPUT"
           fi
+          echo "Target tag: ${{ steps.target.outputs.tag }}"
+
+      - name: Check if tag exists on remote
+        id: tagcheck
+        run: |
+          # Query the remote directly — local clone may or may not have
+          # the tag depending on fetch behavior. We want to know whether
+          # the *remote* has the tag.
+          if git ls-remote --tags origin "refs/tags/${{ steps.target.outputs.tag }}" | grep -q .; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag ${{ steps.target.outputs.tag }} already exists on remote"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${{ steps.target.outputs.tag }} does not exist on remote"
+          fi
+
+      - name: Create and push tag
+        if: steps.tagcheck.outputs.exists == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.target.outputs.tag }}"
+          git push origin "${{ steps.target.outputs.tag }}"
+          echo "Created and pushed ${{ steps.target.outputs.tag }}"
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: "Link Inbox Processor ${{ steps.tag.outputs.tag }}"
+          tag_name: ${{ steps.target.outputs.tag }}
+          name: "Link Inbox Processor ${{ steps.target.outputs.tag }}"
           body: |
-            See [the work-note plan](https://github.com/${{ github.repository }}/blob/${{ steps.tag.outputs.tag }}/v${{ steps.version.outputs.version }}/Plan.md) for the full change list.
+            See the [v${{ steps.version.outputs.version }}/Plan.md](https://github.com/${{ github.repository }}/blob/${{ steps.target.outputs.tag }}/v${{ steps.version.outputs.version }}/Plan.md) for the full change list.
 
             ## Install
 

@@ -153,23 +153,22 @@ No GitHub Releases needed — BRAT pulls `main.js` + `manifest.json` directly.
 
 ### Optional: GitHub Releases for versioned installs
 
-A `.github/workflows/release.yml` Action runs on every `v*` tag push
-and creates a GitHub Release with `main.js` + `manifest.json` + `styles.css`
-attached. Use `scripts/release.ps1` locally to bump the version, build,
-commit, push main, tag, push tag — the Action takes over from the tag
-push and finalises the release. Manual `workflow_dispatch` is also
-supported via the Actions tab (input: tag name).
+A `.github/workflows/release.yml` Action runs on every push to `main`.
+It reads the new `manifest.json` version, creates the matching `vX.Y.Z`
+tag if it doesn't exist, and publishes a GitHub Release with `main.js`,
+`manifest.json`, and `styles.css` attached. Zero manual steps after the
+push.
 
-Release flow:
+**Release flow:**
 
-```powershell
-pwsh .\scripts\release.ps1           # 4 [Y/n] prompts: push, tag, push tag, gh release
-                                    # — except the GH Action does the last step automatically
-                                    # if you push the tag yourself
-```
+1. `pwsh .\scripts\release.ps1` — bumps version, builds, commits locally.
+   Single [Y/n] prompt before the push.
+2. You push `main` from your IDE.
+3. GH Action picks it up, tags, releases.
 
-OR push the tag manually after `release.ps1 -SkipPush` finishes, and the
-Action does the rest.
+Manual re-runs of the Action (e.g. for re-publishing a release with
+corrected notes) are supported via the Actions tab → "Run workflow"
+with a custom tag input.
 
 ---
 

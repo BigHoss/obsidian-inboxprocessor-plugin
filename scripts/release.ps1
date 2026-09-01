@@ -1,8 +1,12 @@
 # Release helper for obsidian-inboxprocessor-plugin
 #
 # Bumps the plugin version, builds, commits, and walks you through
-# `git push` / `git tag` / `gh release create` — each with an explicit
-# [Y/n] confirmation. Default answer is No, so an accidental Enter never
+# `git push origin main` with an explicit [Y/n] confirmation. After
+# v0.4.1, the GH Action (`.github/workflows/release.yml`) takes over
+# from the push: it reads the new manifest version, creates the matching
+# tag, and publishes the GitHub Release.
+#
+# Default answer on the prompt is No, so an accidental Enter never
 # pushes anything.
 #
 # Usage:
@@ -11,7 +15,9 @@
 #   pwsh ./scripts/release.ps1 -Major          # major bump (0.4.0 -> 1.0.0)
 #   pwsh ./scripts/release.ps1 -DryRun         # print every step, do nothing
 #   pwsh ./scripts/release.ps1 -SkipPush       # commit locally only, no push
-#   pwsh ./scripts/release.ps1 -Notes "..."    # custom release notes (else generated)
+#
+# Release notes are not passed from this script — the GH Action links to
+# the vN.M/Plan.md work-note in the release body. Write the plan there.
 #
 # Why a script and not a single command? Because the last release was
 # two separate failures: bash-ism `$(cat ...)` in PowerShell, and a
@@ -23,8 +29,7 @@ param(
     [switch]$Minor,
     [switch]$Major,
     [switch]$DryRun,
-    [switch]$SkipPush,
-    [string]$Notes = ""
+    [switch]$SkipPush
 )
 
 $ErrorActionPreference = "Stop"
@@ -147,6 +152,12 @@ try {
     # ----------------------------------------------------------------------
     # 7-10. Network-mutating steps — each gated by [Y/n] confirm
     # ----------------------------------------------------------------------
+    # After v0.4.1, the .github/workflows/release.yml Action takes over
+    # from here: when you push main, the Action reads the manifest version,
+    # creates the matching tag, and publishes the GitHub Release. So this
+    # script only handles the version-bump + commit + push-main. No more
+    # local tag-push.
+    # ----------------------------------------------------------------------
     if ($SkipPush) {
         Write-Host ""
         Write-Host "SkipPush requested. Done at commit step." -ForegroundColor Yellow
@@ -154,53 +165,24 @@ try {
     }
 
     if ($DryRun) {
-        Write-Host "  [dry-run] would prompt before: git push, git tag, git push --tags, gh release create"
+        Write-Host "  [dry-run] would prompt before: git push"
         return
     }
 
     # 7. git push origin main
+    # After this, the GH Action creates the tag and release automatically.
     Write-Host ""
-    $confirm = Read-Host "git push origin main? [y/N]"
+    $confirm = Read-Host "git push origin main? (GH Action will create the tag + release from this) [y/N]"
     if ($confirm -notin @("y", "Y", "yes", "Yes", "YES")) {
         Write-Host "Aborted at push step. Commit is local." -ForegroundColor Yellow
         return
     }
     git push origin main 2>&1
     if ($LASTEXITCODE -ne 0) { throw "git push failed" }
-    Write-Host "[ok] pushed main"
-
-    # 8. git tag
-    $confirm = Read-Host "create tag $tag? [y/N]"
-    if ($confirm -notin @("y", "Y", "yes", "Yes", "YES")) {
-        Write-Host "Aborted at tag step. main is pushed; tag is NOT created." -ForegroundColor Yellow
-        return
-    }
-    git tag $tag
-    Write-Host "[ok] tagged $tag"
-
-    # 9. git push --tags
-    $confirm = Read-Host "git push origin $tag? [y/N]"
-    if ($confirm -notin @("y", "Y", "yes", "Yes", "YES")) {
-        Write-Host "Aborted at tag-push step. Tag is local; not pushed." -ForegroundColor Yellow
-        return
-    }
-    git push origin $tag 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "git push tag failed" }
-    Write-Host "[ok] pushed tag $tag"
-
-    # 10. gh release create
-    $releaseNotes = if ($Notes) { $Notes } else { "Release $tag" }
-    $confirm = Read-Host "gh release create $tag (with notes: '$releaseNotes')? [y/N]"
-    if ($confirm -notin @("y", "Y", "yes", "Yes", "YES")) {
-        Write-Host "Aborted at release step. Tag is pushed; no GitHub release created." -ForegroundColor Yellow
-        return
-    }
-    gh release create $tag main.js manifest.json styles.css `
-        --title "Link Inbox Processor $tag" `
-        --notes $releaseNotes 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+    Write-Host "[ok] pushed main" -ForegroundColor Green
     Write-Host ""
-    Write-Host "[ok] release created: https://github.com/$Repo/releases/tag/$tag" -ForegroundColor Green
+    Write-Host "GH Action will pick this up shortly and create the tag + release." -ForegroundColor Cyan
+    Write-Host "Watch: https://github.com/$Repo/actions" -ForegroundColor Cyan
 }
 finally {
     Pop-Location
