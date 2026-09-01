@@ -1,13 +1,18 @@
 {
   "name": "obsidian-inboxprocessor-plugin",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Processes iOS-shared links from 0. Inbox/0. Inbox.md into templated notes.",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "node esbuild.config.mjs production"
   },
-  "keywords": ["obsidian", "plugin", "inbox", "links"],
+  "keywords": [
+    "obsidian",
+    "plugin",
+    "inbox",
+    "links"
+  ],
   "author": "Raphael",
   "license": "MIT",
   "devDependencies": {
