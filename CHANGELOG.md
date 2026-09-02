@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.6.6](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.5...v0.6.6) (2026-09-02)
+
+
+### Bug Fixes
+
+* switch debug-log I/O to Node fs, normalize path display ([5b8b190](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/5b8b190f734255d67575e1c595bc9a433b6ef598))
+
 ### [0.6.5](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.4...v0.6.5) (2026-09-02)
 
 
