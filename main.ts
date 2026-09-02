@@ -355,11 +355,20 @@ async function enrichWithLlm(
     }
     const parsed = JSON.parse(json);
 
-    // Resolve linkType against configured slots
+    // Resolve linkType against configured slots. Defensive guard:
+    // if templates is undefined / non-array (partial data.json), fall
+    // back to an empty slot rather than crashing the LLM enrichment.
     const requestedType = String(parsed.linkType ?? "").trim();
+    const templates = Array.isArray(settings.templates) && settings.templates.length > 0
+      ? settings.templates
+      : [];
     const slot =
-      settings.templates.find((t) => t.linkType === requestedType) ??
-      settings.templates[0];
+      templates.find((t) => t.linkType === requestedType) ??
+      templates[0];
+    if (!slot) {
+      // No templates at all — can't continue.
+      throw new Error("No templates configured; can't classify link");
+    }
 
     // Validate destination — if LLM gave something unsafe, fall back to the
     // slot's defaultDestination.
@@ -972,10 +981,19 @@ export default class KusterInboxPlugin extends Plugin {
     onProgress?.(`Fetching ${parsed.url} via LLM…`);
     const llm = await enrichWithLlm(this.app, this.settings, parsed.url);
 
-    // 2. Pick template + destination
+    // 2. Pick template + destination. Defensive guard mirrors the one
+    // in enrichWithLlm above: if templates is undefined / non-array
+    // (partial data.json), fall back to empty + let the caller notice.
+    const safeTemplates = Array.isArray(this.settings.templates) && this.settings.templates.length > 0
+      ? this.settings.templates
+      : [];
     const slot =
-      this.settings.templates.find((t) => t.linkType === (llm?.linkType ?? "")) ??
-      this.settings.templates[0];
+      safeTemplates.find((t) => t.linkType === (llm?.linkType ?? "")) ??
+      safeTemplates[0];
+    if (!slot) {
+      new Notice("Templates settings are missing. Reload the plugin to restore defaults.", 10000);
+      return null;
+    }
     const template = templatesByType.get(slot.linkType) ?? defaultTemplate;
     const destinationDir = (llm?.suggestedDestination || slot.defaultDestination).trim();
 
@@ -1668,8 +1686,13 @@ async function reprocessInboxSubdirs(
   onProgress?: (msg: string) => void,
 ): Promise<ReprocessResult> {
   const result: ReprocessResult = { processed: 0, skipped: 0, failed: 0, trashed: 0 };
+  // Early-return guard: without the LLM we can scan + report missing
+  // fields, but we can't fill them. The original code had this as a
+  // dead expression (`!t.llmEnabled||t.openrouterApiKey;`) that the
+  // minifier stripped, so the reprocess ran anyway and then trashed
+  // every note because no fields could be filled. Catch it now.
   if (!settings.llmEnabled || !settings.openrouterApiKey) {
-    // Without the LLM we can't fill missing fields; just count + skip.
+    return result;
   }
   const inboxRoot = "0. Inbox";
   if (!(await app.vault.adapter.exists(inboxRoot))) return result;
@@ -1677,7 +1700,13 @@ async function reprocessInboxSubdirs(
   for (const [subdir, ttype] of Object.entries(INBOX_SUBDIR_TYPES)) {
     const subdirPath = `${inboxRoot}/${subdir}`;
     if (!(await app.vault.adapter.exists(subdirPath))) continue;
-    const listing = await app.vault.adapter.list(subdirPath);
+    // adapter.list() is documented to return TAbstractFile[] but can
+    // return undefined on corrupted vault state. The minified
+    // 'c is not iterable' bug from the v0.6.2 release was exactly
+    // that: `for (let g of c)` where c was the listing. Fall back
+    // to an empty array rather than crashing the whole command.
+    const rawListing = await app.vault.adapter.list(subdirPath);
+    const listing = Array.isArray(rawListing) ? rawListing : [];
     // adapter.list() returns TAbstractFile[]; we want only files whose
     // adapter.exists returns true (this filters out folders whose paths
     // appear in the listing). Async filter via map+reduce.
@@ -1690,9 +1719,9 @@ async function reprocessInboxSubdirs(
     }
 
     // Determine required fields for this type from the configured template
-    const templatePath = settings.templates.find(
-      (t) => t.linkType === ttype,
-    )?.templatePath;
+    const templatePath = Array.isArray(settings.templates) && settings.templates.length > 0
+      ? settings.templates.find((t) => t.linkType === ttype)?.templatePath
+      : null;
     if (!templatePath) continue;
     const requiredFields = await readTemplateRequiredFields(app, templatePath);
     if (requiredFields.length === 0) continue;
