@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.6.4](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.3...v0.6.4) (2026-09-02)
+
+
+### Refactoring
+
+* reorder status-bar context menu — admin/logs at the bottom ([c1c95f5](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/c1c95f5424b559eaebc437dce820169398591501))
+
 ### [0.6.3](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.2...v0.6.3) (2026-09-02)
 
 
