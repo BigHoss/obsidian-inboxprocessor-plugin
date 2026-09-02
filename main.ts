@@ -2507,7 +2507,7 @@ class KusterInboxSettingTab extends PluginSettingTab {
         );
         pathSetting.descEl.empty();
         pathSetting.descEl.createEl("code", {
-          text: `${dir}/process-failures.log`,
+          text: path.join(dir, "process-failures.log"),
         });
       } catch {
         // best-effort
@@ -2592,7 +2592,7 @@ class KusterInboxSettingTab extends PluginSettingTab {
         );
         debugPathSetting.descEl.empty();
         debugPathSetting.descEl.createEl("code", {
-          text: `${dir}/debug.log`,
+          text: path.join(dir, "debug.log"),
         });
       } catch {
         // best-effort
@@ -3130,7 +3130,12 @@ async function readFailureLog(app: App, manifestDir: string): Promise<string | n
 // Debug log — append-only trace of plugin activity when settings.debugEnabled
 // is true. Same on-disk directory as the failure log; different filename.
 // One line per entry: ISO timestamp + level + message. Multi-line messages
-// are joined with \u23ce to keep the file greppable.
+// are joined with ⏎ to keep the file greppable.
+//
+// Uses Node's `fs/promises` directly (not `app.vault.adapter.write`).
+// The vault adapter is designed for vault-relative paths; for OS-level
+// absolute paths under the app-data directory, Node's fs is more
+// reliable and handles platform-specific separators correctly.
 // ============================================================================
 
 const DEBUG_LOG_FILE = "debug.log";
@@ -3139,7 +3144,7 @@ type DebugLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
 function formatDebugLine(level: DebugLevel, msg: string): string {
   const ts = new Date().toISOString();
   // Collapse multi-line messages so each log entry is one line.
-  const flat = String(msg).replace(/\r?\n/g, "\u23ce");
+  const flat = String(msg).replace(/\r?\n/g, "↩");
   return `${ts} [${level}] ${flat}\n`;
 }
 
@@ -3155,14 +3160,30 @@ async function appendDebugLog(
     const dir = await pluginDataDir(app, manifestDir);
     const logPath = `${dir}/${DEBUG_LOG_FILE}`;
     const line = formatDebugLine(level, msg);
-    if (await app.vault.adapter.exists(logPath)) {
-      const existing = await app.vault.adapter.read(logPath);
-      await app.vault.adapter.write(logPath, existing + line);
-    } else {
-      await app.vault.adapter.write(logPath, line);
+    // @ts-ignore — require is available in Electron renderer with nodeIntegration
+    const fs = require("fs/promises") as typeof import("fs/promises");
+    await fs.appendFile(logPath, line, "utf8");
+  } catch (e) {
+    // Log the failure to console (and the existing failure log) so the
+    // user can see WHY debug logging isn't working. The catch exists
+    // so logging never crashes the host command, but a silent failure
+    // is worse than a noisy one.
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("Link Inbox Processor: debug log write failed", e);
+    try {
+      // Best-effort: also surface the failure in the failure log so
+      // the user has a paper trail.
+      // @ts-ignore
+      const fs2 = require("fs/promises") as typeof import("fs/promises");
+      const dir2 = await pluginDataDir(app, manifestDir);
+      await fs2.appendFile(
+        `${dir2}/process-failures.log`,
+        `${new Date().toISOString()} | debug-log | ${msg.replace(/\n/g, " ").trim()}\n`,
+        "utf8",
+      );
+    } catch {
+      // If even the failure log write fails, fall back to console only.
     }
-  } catch {
-    // Logging must never crash the host command. Swallow.
   }
 }
 
@@ -3172,8 +3193,13 @@ async function readDebugLog(
 ): Promise<string | null> {
   const dir = await pluginDataDir(app, manifestDir);
   const logPath = `${dir}/${DEBUG_LOG_FILE}`;
-  if (!(await app.vault.adapter.exists(logPath))) return null;
-  return await app.vault.adapter.read(logPath);
+  // @ts-ignore
+  const fs = require("fs/promises") as typeof import("fs/promises");
+  try {
+    return await fs.readFile(logPath, "utf8");
+  } catch {
+    return null;
+  }
 }
 
 async function clearDebugLog(
@@ -3182,9 +3208,20 @@ async function clearDebugLog(
 ): Promise<boolean> {
   const dir = await pluginDataDir(app, manifestDir);
   const logPath = `${dir}/${DEBUG_LOG_FILE}`;
-  if (!(await app.vault.adapter.exists(logPath))) return false;
-  await app.vault.adapter.remove(logPath);
-  return true;
+  // @ts-ignore
+  const fs = require("fs/promises") as typeof import("fs/promises");
+  try {
+    await fs.unlink(logPath);
+    return true;
+  } catch (e) {
+    // ENOENT (file doesn't exist) is normal — caller treats as "nothing
+    // to clear". Anything else is unexpected but we don't want to
+    // crash the host command.
+    if (e instanceof Error && "code" in e && (e as { code: string }).code === "ENOENT") {
+      return false;
+    }
+    return false;
+  }
 }
 
 // ============================================================================
