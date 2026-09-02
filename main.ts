@@ -725,58 +725,6 @@ export default class KusterInboxPlugin extends Plugin {
           .onClick(() => this.refreshStatusBar()),
       );
       menu.addSeparator();
-      menu.addItem((item) =>
-        item
-          .setTitle("View failure log")
-          .setIcon("file-warning")
-          .onClick(async () => {
-            const text = await readFailureLog(this.app, this.manifest.dir);
-            if (text === null) {
-              new Notice("No failures recorded yet");
-              return;
-            }
-            const dir = await pluginDataDir(this.app, this.manifest.dir);
-            await this.app.workspace.openLinkText(`${dir}/process-failures.log`, "", false);
-          }),
-      );
-      menu.addItem((item) =>
-        item
-          .setTitle("Clear failure log")
-          .setIcon("trash")
-          .onClick(async () => {
-            const cleared = await clearFailureLog(this.app, this.manifest.dir);
-            new Notice(cleared ? "Failure log cleared" : "Nothing to clear");
-          }),
-      );
-      menu.addSeparator();
-      menu.addItem((item) =>
-        item
-          .setTitle("View debug log")
-          .setIcon("file-cog")
-          .onClick(async () => {
-            const text = await readDebugLog(this.app, this.manifest.dir);
-            if (text === null) {
-              new Notice(
-                "Debug log is empty (or debug mode is off and no entries yet).",
-                5000,
-              );
-              return;
-            }
-            const dir = await pluginDataDir(this.app, this.manifest.dir);
-            const logPath = `${dir}/debug.log`;
-            await this.app.workspace.openLinkText(logPath, "", false);
-          }),
-      );
-      menu.addItem((item) =>
-        item
-          .setTitle("Clear debug log")
-          .setIcon("eraser")
-          .onClick(async () => {
-            const cleared = await clearDebugLog(this.app, this.manifest.dir);
-            new Notice(cleared ? "Debug log cleared" : "Nothing to clear");
-          }),
-      );
-      menu.addSeparator();
       // Project-template check + reprocess — discoverable from the status
       // bar so NN users (no file-menu event) can find them.
       menu.addItem((item) =>
@@ -826,6 +774,58 @@ export default class KusterInboxPlugin extends Plugin {
               this.pluginLog("ERROR", `reprocess failed: ${msg}`);
               new Notice(`Reprocess failed: ${msg}`, 15000);
             }
+          }),
+      );
+      menu.addSeparator();
+      menu.addItem((item) =>
+        item
+          .setTitle("View failure log")
+          .setIcon("file-warning")
+          .onClick(async () => {
+            const text = await readFailureLog(this.app, this.manifest.dir);
+            if (text === null) {
+              new Notice("No failures recorded yet");
+              return;
+            }
+            const dir = await pluginDataDir(this.app, this.manifest.dir);
+            await this.app.workspace.openLinkText(`${dir}/process-failures.log`, "", false);
+          }),
+      );
+      menu.addItem((item) =>
+        item
+          .setTitle("Clear failure log")
+          .setIcon("trash")
+          .onClick(async () => {
+            const cleared = await clearFailureLog(this.app, this.manifest.dir);
+            new Notice(cleared ? "Failure log cleared" : "Nothing to clear");
+          }),
+      );
+      menu.addSeparator();
+      menu.addItem((item) =>
+        item
+          .setTitle("View debug log")
+          .setIcon("file-cog")
+          .onClick(async () => {
+            const text = await readDebugLog(this.app, this.manifest.dir);
+            if (text === null) {
+              new Notice(
+                "Debug log is empty (or debug mode is off and no entries yet).",
+                5000,
+              );
+              return;
+            }
+            const dir = await pluginDataDir(this.app, this.manifest.dir);
+            const logPath = `${dir}/debug.log`;
+            await this.app.workspace.openLinkText(logPath, "", false);
+          }),
+      );
+      menu.addItem((item) =>
+        item
+          .setTitle("Clear debug log")
+          .setIcon("eraser")
+          .onClick(async () => {
+            const cleared = await clearDebugLog(this.app, this.manifest.dir);
+            new Notice(cleared ? "Debug log cleared" : "Nothing to clear");
           }),
       );
       menu.showAtMouseEvent(ev);
