@@ -29,6 +29,15 @@ import {
   TFile,
 } from "obsidian";
 
+// In-process project template scaffolder. Replaces the Python
+// `init-project.py` shell-out path; the plugin imports this directly
+// rather than spawning a subprocess.
+import {
+  plan as scaffoldPlan,
+  scaffold as scaffoldProject,
+  ScaffoldAction,
+} from "./src/init-project";
+
 // ============================================================================
 // Settings
 // ============================================================================
@@ -588,21 +597,19 @@ export default class KusterInboxPlugin extends Plugin {
 
     // Command: check projects against templates — shows a modal listing
     // misaligned projects (v0.5 template) and lets the user apply fixes
-    // per-project via `init-project.py --merge`.
+    // per-project via the in-process TypeScript scaffolder.
     this.addCommand({
       id: "check-projects-against-templates",
       name: "Check projects against templates",
       callback: async () => {
-        const py = await findPython();
         const basePath = this.app.vault.adapter.basePath.replace(/[/\\]+$/, "");
         const sep = basePath.includes("\\") ? "\\" : "/";
         const misalignments = await scanProjectsAgainstTemplate(
-          this.app, this.settings, py,
+          this.app, this.settings,
         );
         await new Promise<void>((resolve) => {
           new ProjectCheckModal(this.app, {
             misalignments,
-            python: py,
             basePath,
             sep,
             onDone: () => resolve(),
@@ -629,7 +636,7 @@ export default class KusterInboxPlugin extends Plugin {
           new Notice(`Reprocess: ${msg}`, 2500);
         try {
           const result = await reprocessInboxSubdirs(
-            this.app, this.settings, null, onProgress,
+            this.app, this.settings, onProgress,
           );
           new Notice(
             `Inbox reprocess done: ${result.processed} processed, ${result.skipped} already complete, ${result.failed} failed, ${result.trashed} trashed (missing irrecoverable fields).`,
@@ -707,16 +714,14 @@ export default class KusterInboxPlugin extends Plugin {
           .setTitle("Check projects against templates")
           .setIcon("check-circle")
           .onClick(async () => {
-            const py = await findPython();
             const basePath = this.app.vault.adapter.basePath.replace(/[/\\]+$/, "");
             const sep = basePath.includes("\\") ? "\\" : "/";
             const misalignments = await scanProjectsAgainstTemplate(
-              this.app, this.settings, py,
+              this.app, this.settings,
             );
             await new Promise<void>((resolve) => {
               new ProjectCheckModal(this.app, {
                 misalignments,
-                python: py,
                 basePath,
                 sep,
                 onDone: () => resolve(),
@@ -740,7 +745,7 @@ export default class KusterInboxPlugin extends Plugin {
               const onProgress = (msg: string) =>
                 new Notice(`Reprocess: ${msg}`, 2500);
               const result = await reprocessInboxSubdirs(
-                this.app, this.settings, null, onProgress,
+                this.app, this.settings, onProgress,
               );
               new Notice(
                 `Reprocess: ${result.processed} processed, ${result.skipped} complete, ${result.failed} failed, ${result.trashed} trashed.`,
@@ -1135,81 +1140,44 @@ export default class KusterInboxPlugin extends Plugin {
     const destDir = `${this.settings.projectsRoot}/${result.typeValue}/${result.name}`;
     new Notice(`Scaffolding ${destDir}…`, 5000);
 
-    const py = await findPython();
-    if (!py) {
-      new Notice(
-        `Could not find Python (tried: python, python3, py -3). Install Python or update PATH, then retry.`,
-        10000,
-      );
-      await appendFailureLog(
-        this.app,
-        this.manifest,
-        "create-project-from-selection",
-        "Python not found on PATH",
-      );
-      return;
-    }
-    // Resolve vault-relative script path to absolute. basePath ends with
-    // the separator on some platforms and not others — normalise.
+    // Resolve vault-relative template directory to absolute.
     const basePath = this.app.vault.adapter.basePath.replace(/[/\\]+$/, "");
     const sep = basePath.includes("\\") ? "\\" : "/";
-    const scriptAbsPath = this.settings.templateScriptPath.startsWith(basePath)
+    const templateDirAbs = this.settings.templateScriptPath.startsWith(basePath)
       ? this.settings.templateScriptPath
       : `${basePath}${sep}${this.settings.templateScriptPath.replace(/\//g, sep)}`;
-    const args = [
-      scriptAbsPath,
-      "--name", result.name,
-      "--key", result.key,
-      "--dst", destDir,
-    ];
-    let stdout = "";
-    let stderr = "";
-    let code = -1;
+    // templateScriptPath is the path to init-project.py; the template
+    // directory is one level up (parent of /scripts/).
+    const templateDir = templateDirAbs.replace(/[/\\]scripts[/\\]init-project\.py$/, "");
+
+    let actions: ScaffoldAction[];
     try {
-      const result2 = await new Promise<{ code: number; stdout: string; stderr: string }>(
-        (resolve, reject) => {
-          // Use Node child_process via require — bundled by esbuild since
-          // Node built-ins are not in the external list above.
-          // @ts-ignore — require available in Electron renderer with nodeIntegration
-          const cp = require("child_process");
-          const proc = cp.spawn(py.bin, [...py.args, ...args], {
-            cwd: this.app.vault.adapter.basePath,
-            env: { ...process.env, OBSIDIAN_VAULT_PATH: this.app.vault.adapter.basePath },
-            shell: py.shell,
-          });
-          let out = "";
-          let err = "";
-          proc.stdout.on("data", (d: Buffer) => { out += d.toString(); });
-          proc.stderr.on("data", (d: Buffer) => { err += d.toString(); });
-          proc.on("error", (e: Error) => reject(e));
-          proc.on("close", (c: number | null) => resolve({ code: c ?? -1, stdout: out, stderr: err }));
-        },
-      );
-      code = result2.code;
-      stdout = result2.stdout;
-      stderr = result2.stderr;
+      actions = await scaffoldProject(templateDir, destDir, {
+        name: result.name,
+        key: result.key,
+        status: "working",
+        vaultRoot: basePath,
+        projectRelpath: destDir,
+      });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      new Notice(`Spawn failed: ${msg}`, 10000);
+      new Notice(`Scaffold failed: ${msg}`, 10000);
       await appendFailureLog(
         this.app,
         this.manifest,
         "create-project-from-selection",
-        `spawn failed: ${msg}`,
+        `scaffold failed: ${msg}`,
       );
       return;
     }
 
-    if (code !== 0) {
-      const tail = (stderr || stdout).slice(-800);
-      new Notice(`init-project.py exited ${code}: ${tail}`, 12000);
-      await appendFailureLog(
-        this.app,
-        this.manifest,
-        "create-project-from-selection",
-        `exit ${code}: ${tail}`,
+    // Surface any unresolved placeholders so the user notices.
+    const unresolved = actions.flatMap((a) => a.unresolved ?? []);
+    if (unresolved.length > 0) {
+      new Notice(
+        `Scaffold completed with unresolved placeholders: ${unresolved.join(", ")}. Check templates.`,
+        15000,
       );
-      return;
     }
 
     // Try to open the new project's index note.
@@ -1429,11 +1397,10 @@ interface ProjectMisalignment {
   missingFiles: string[];  // ["v0.1/Plan.md", "CLAUDE.md", ...]
 }
 
-// Run init-project.py --dry-run --merge against one project and parse the
-// output. Returns the list of files that would be created (i.e. missing
+// Plan a scaffold against one project using the in-process TypeScript
+// engine. Returns the list of files that would be created (i.e. missing
 // from the destination).
 async function dryRunProjectScaffold(
-  python: PythonInvoker,
   basePath: string,
   sep: string,
   typeValue: string,
@@ -1445,56 +1412,49 @@ async function dryRunProjectScaffold(
   const scriptAbsPath = templateScriptPath.startsWith(basePath)
     ? templateScriptPath
     : `${basePath}${sep}${templateScriptPath.replace(/\//g, sep)}`;
+  // templateScriptPath is the path to init-project.py; the template
+  // directory is one level up (parent of /scripts/).
+  const templateDir = scriptAbsPath.replace(/[/\\]scripts[/\\]init-project\.py$/, "");
 
-  return new Promise<ProjectMisalignment | null>((resolve) => {
-    // @ts-ignore — child_process available in Electron renderer with nodeIntegration
-    const cp = require("child_process");
-    const proc = cp.spawn(
-      python.bin,
-      [...python.args, scriptAbsPath, "--name", projectName, "--key", projectKey,
-       "--dst", projectPath, "--merge", "--dry-run"],
-      { shell: python.shell, windowsHide: true },
-    );
-    let stdout = "";
-    let stderr = "";
-    proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
-    proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
-    let procError: Error | null = null;
-    proc.on("error", (e: Error) => {
-      procError = e;
+  let actions: ScaffoldAction[];
+  try {
+    actions = await scaffoldPlan(templateDir, projectPath, {
+      name: projectName,
+      key: projectKey,
+      status: "working",
+      vaultRoot: basePath,
+      projectRelpath: projectPath,
+      merge: true,
     });
-    proc.on("close", () => {
-      const missing: string[] = [];
-      // init-project.py --dry-run prints lines like:
-      //   RENDER <path>
-      //   COPY   <path>
-      // Each non-empty plan item is a file that would be created or
-      // copied. (Earlier formats used [RENDER] / [COPY] bracketed tags,
-      // but the current init-project.py output uses unbracketed tags.)
-      const re = /^(RENDER|COPY)\s+(.+)$/gm;
-      let match: RegExpExecArray | null;
-      while ((match = re.exec(stdout)) !== null) {
-        missing.push(match[2].trim());
-      }
-      // If the subprocess failed (e.g. python binary not found, or the
-      // script file is missing), surface that as a misalignment so the
-      // user knows verification didn't run for that project.
-      if (procError) {
-        missing.push(`(verification failed: ${procError.message})`);
-      }
-      // Both new destinations AND existing misaligned ones produce the
-      // same RENDER/COPY output. The discriminator is whether the
-      // destination directory exists at all — but for the misalignment
-      // report we treat both as "this project needs scaffolding".
-      resolve({
-        typeValue,
-        projectName,
-        projectPath,
-        projectKey,
-        missingFiles: missing,
-      });
-    });
-  });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // Surface the verification failure as a misalignment so the user
+    // knows something went wrong rather than silently passing.
+    return {
+      typeValue,
+      projectName,
+      projectPath,
+      projectKey,
+      missingFiles: [`(verification failed: ${msg})`],
+    };
+  }
+
+  // Map ScaffoldAction[] to the missingFiles list. Each render/copy
+  // action whose destination does NOT already exist represents a missing
+  // file. Skip actions (merge: file exists) are NOT missing.
+  const missing: string[] = [];
+  for (const a of actions) {
+    if (a.action === "render" || a.action === "copy") {
+      missing.push(a.dstPath);
+    }
+  }
+  return {
+    typeValue,
+    projectName,
+    projectPath,
+    projectKey,
+    missingFiles: missing,
+  };
 }
 
 // Walk all projects under settings.projectsRoot, run dry-run against each,
@@ -1502,9 +1462,7 @@ async function dryRunProjectScaffold(
 async function scanProjectsAgainstTemplate(
   app: App,
   settings: KusterInboxSettings,
-  python: PythonInvoker | null,
 ): Promise<ProjectMisalignment[]> {
-  if (!python) return [];
   const basePath = app.vault.adapter.basePath.replace(/[/\\]+$/, "");
   const sep = basePath.includes("\\") ? "\\" : "/";
   const root = settings.projectsRoot.replace(/[/\\]+$/, "");
@@ -1520,7 +1478,7 @@ async function scanProjectsAgainstTemplate(
       const projName = projEntry.name;
       if (await app.vault.adapter.exists(projEntry.path) === false) continue;
       const result = await dryRunProjectScaffold(
-        python, basePath, sep, typeName, projName, projEntry.path,
+        basePath, sep, typeName, projName, projEntry.path,
       );
       if (result && result.missingFiles.length > 0) {
         misaligned.push(result);
@@ -1537,7 +1495,6 @@ async function scanProjectsAgainstTemplate(
 class ProjectCheckModal extends Modal {
   private app: App;
   private misalignments: ProjectMisalignment[];
-  private python: PythonInvoker | null;
   private basePath: string;
   private sep: string;
   private onDone: (results: { fixed: string[]; skipped: string[]; failed: { name: string; error: string }[] }) => void;
@@ -1546,7 +1503,6 @@ class ProjectCheckModal extends Modal {
     app: App,
     opts: {
       misalignments: ProjectMisalignment[];
-      python: PythonInvoker | null;
       basePath: string;
       sep: string;
       onDone: (r: ProjectMisalignment[]) => void;
@@ -1555,7 +1511,6 @@ class ProjectCheckModal extends Modal {
     super(app);
     this.app = app;
     this.misalignments = opts.misalignments;
-    this.python = opts.python;
     this.basePath = opts.basePath;
     this.sep = opts.sep;
     this.onDone = opts.onDone as ProjectCheckModal["onDone"];
@@ -1607,7 +1562,7 @@ class ProjectCheckModal extends Modal {
       fixBtn.addEventListener("click", async () => {
         fixBtn.disabled = true;
         fixBtn.setText("Applying…");
-        const result = await applyProjectFix(this.app, this.python, this.basePath, this.sep, m);
+        const result = await applyProjectFix(this.app, this.basePath, this.sep, m);
         fixBtn.setText(result.ok ? "Fixed ✓" : `Failed: ${result.error}`);
       });
       const skipBtn = actions.createEl("button", { text: "Skip" });
@@ -1635,35 +1590,32 @@ class ProjectCheckModal extends Modal {
 // {ok: true} on success or {ok: false, error: string} on failure.
 async function applyProjectFix(
   app: App,
-  python: PythonInvoker | null,
   basePath: string,
   sep: string,
   m: ProjectMisalignment,
 ): Promise<{ ok: boolean; error?: string }> {
-  if (!python) return { ok: false, error: "Python not found" };
   const templateScriptPath = "5. System/Templates/Project Folder Template/scripts/init-project.py";
   const scriptAbsPath = templateScriptPath.startsWith(basePath)
     ? templateScriptPath
     : `${basePath}${sep}${templateScriptPath.replace(/\//g, sep)}`;
-  return new Promise((resolve) => {
-    // @ts-ignore
-    const cp = require("child_process");
-    const proc = cp.spawn(
-      python.bin,
-      [...python.args, scriptAbsPath, "--name", m.projectName, "--key", m.projectKey,
-       "--dst", m.projectPath, "--merge"],
-      { shell: python.shell, windowsHide: true, cwd: basePath,
-        env: { ...process.env, OBSIDIAN_VAULT_PATH: basePath } },
-    );
-    let stderr = "";
-    proc.stdout.on("data", () => {});
-    proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
-    proc.on("error", (e: Error) => resolve({ ok: false, error: e.message }));
-    proc.on("close", (code: number | null) => {
-      if (code === 0) resolve({ ok: true });
-      else resolve({ ok: false, error: `exit ${code}: ${stderr.slice(-300)}` });
+  // templateScriptPath is the path to init-project.py; the template
+  // directory is one level up (parent of /scripts/).
+  const templateDir = scriptAbsPath.replace(/[/\\]scripts[/\\]init-project\.py$/, "");
+
+  try {
+    await scaffoldProject(templateDir, m.projectPath, {
+      name: m.projectName,
+      key: m.projectKey,
+      status: "working",
+      vaultRoot: basePath,
+      projectRelpath: m.projectPath,
+      merge: true,
     });
-  });
+    return { ok: true };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { ok: false, error: msg };
+  }
 }
 
 // ============================================================================
@@ -1682,7 +1634,6 @@ interface ReprocessResult {
 async function reprocessInboxSubdirs(
   app: App,
   settings: KusterInboxSettings,
-  python: PythonInvoker | null,
   onProgress?: (msg: string) => void,
 ): Promise<ReprocessResult> {
   const result: ReprocessResult = { processed: 0, skipped: 0, failed: 0, trashed: 0 };
@@ -1727,7 +1678,7 @@ async function reprocessInboxSubdirs(
     if (requiredFields.length === 0) continue;
 
     for (const file of mdFiles) {
-      await processOneFile(app, file, ttype, requiredFields, settings, python, onProgress, result);
+      await processOneFile(app, file, ttype, requiredFields, settings, onProgress, result);
     }
   }
   return result;
@@ -1739,7 +1690,6 @@ async function processOneFile(
   ttype: string,
   requiredFields: string[],
   settings: KusterInboxSettings,
-  python: PythonInvoker | null,
   onProgress: ((msg: string) => void) | undefined,
   result: ReprocessResult,
 ): Promise<void> {
@@ -2938,58 +2888,12 @@ async function readFailureLog(app: App, manifestDir: string): Promise<string | n
 }
 
 // ============================================================================
-// Python detection for the project-scaffold command
+// Project scaffolding is now in-process via src/init-project.ts. The
+// previous Python-detection code was removed when we replaced
+// `child_process.spawn(python, init-project.py, ...)` with a direct
+// `import { scaffold } from "./init-project"`. Kept this comment as
+// a breadcrumb for anyone reading the history.
 // ============================================================================
-
-interface PythonInvoker {
-  bin: string;   // the binary name to run
-  args: string[]; // optional fixed args before the script (e.g. ["-3"] for `py -3`)
-  shell: boolean; // whether to spawn via shell (true on Windows for `.exe` lookup)
-}
-
-// Try the common Python invokers in order. Returns the first one whose
-// `bin --version` exits 0. Cached per plugin session — process spawn is
-// expensive (50–200ms each).
-let pythonCache: PythonInvoker | null = null;
-async function findPython(): Promise<PythonInvoker | null> {
-  if (pythonCache) return pythonCache;
-  const candidates: PythonInvoker[] = process.platform === "win32"
-    ? [
-        { bin: "py", args: ["-3"], shell: true },
-        { bin: "python", args: [], shell: true },
-        { bin: "python3", args: [], shell: true },
-      ]
-    : [
-        { bin: "python3", args: [], shell: false },
-        { bin: "python", args: [], shell: false },
-      ];
-  for (const c of candidates) {
-    try {
-      const ok = await new Promise<boolean>((resolve) => {
-        // @ts-ignore — require available in Electron renderer with nodeIntegration
-        const cp = require("child_process");
-        const proc = cp.spawn(c.bin, [...c.args, "--version"], {
-          shell: c.shell,
-          windowsHide: true,
-        });
-        proc.on("error", () => resolve(false));
-        proc.on("close", (code: number | null) => resolve(code === 0));
-        // 3-second timeout so a hung PATH lookup doesn't block forever.
-        setTimeout(() => {
-          try { proc.kill(); } catch { /* */ }
-          resolve(false);
-        }, 3000);
-      });
-      if (ok) {
-        pythonCache = c;
-        return c;
-      }
-    } catch {
-      // try next
-    }
-  }
-  return null;
-}
 
 function seedClaudeContext(): string {
   return `# Inbox Processor — Classification Context
