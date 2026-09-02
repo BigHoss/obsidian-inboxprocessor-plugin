@@ -1,7 +1,7 @@
 {
   "id": "kuster-inbox-processor",
   "name": "Link Inbox Processor",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "minAppVersion": "1.5.0",
   "description": "Classifies iOS-shared links from 0. Inbox/0. Inbox.md, archives notes on demand, and scaffolds new projects from inbox selections. Atomic, idempotent, LLM-optional.",
   "author": "Raphael (Kuster.live)",

@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.6.3](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.2...v0.6.3) (2026-09-02)
+
+
+### Features
+
+* debug toggle + debug.log (outside vault, status-bar command) ([e33c2d9](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/e33c2d973f030c6529757fabf2b81ed546971450))
+
+
+### Bug Fixes
+
+* 'c is not iterable' in reprocessInboxSubdirs + 2 other unguarded sites ([9f9a783](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/9f9a783c037ab85a951f4e203bc85d42bbef4c02))
+
+
+### Refactoring
+
+* in-process TypeScript scaffolder replaces init-project.py ([a797455](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/a797455e3c474326cdeca9fc02b01119427f5a1e))
+
 ### [0.6.2](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.1...v0.6.2) (2026-09-02)
 
 
