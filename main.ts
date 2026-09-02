@@ -471,7 +471,21 @@ export default class KusterInboxPlugin extends Plugin {
   async onload(): Promise<void> {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 
-    // Ribbon icon — one-click process
+    // Defensive: a partial data.json migration or a manual edit can leave
+    // `templates` undefined or non-array. The original bug (minified
+    // "p is not iterable" from the v0.4 plan) is exactly that — `for...of
+    // undefined` — and was the worst kind of silent crash. Restore the
+    // defaults and surface a Notice so the user knows their config was
+    // bad rather than the plugin failing on every command.
+    if (!Array.isArray(this.settings.templates) || this.settings.templates.length === 0) {
+      this.settings.templates = DEFAULT_SETTINGS.templates.slice();
+      await this.saveData(this.settings);
+      new Notice(
+        "Templates settings were invalid (empty / non-array). Restored to defaults — please review in Settings.",
+        10000,
+      );
+    }
+
     this.addRibbonIcon("inbox", "Process inbox now", () => this.processInbox());
 
     // Command palette + hotkey
@@ -829,9 +843,15 @@ export default class KusterInboxPlugin extends Plugin {
       return;
     }
 
-    // Pre-load all configured templates
+    // Pre-load all configured templates. Belt-and-braces with the
+    // onload() guard above: if a race / partial state ever leaves
+    // settings.templates as undefined or non-array here, fall back to
+    // the defaults rather than crashing the whole command.
+    const templates = Array.isArray(this.settings.templates) && this.settings.templates.length > 0
+      ? this.settings.templates
+      : DEFAULT_SETTINGS.templates;
     const templatesByType = new Map<string, string>();
-    for (const slot of this.settings.templates) {
+    for (const slot of templates) {
       const tf = this.resolveFile(slot.templatePath);
       if (tf) templatesByType.set(slot.linkType, await this.app.vault.read(tf));
     }
@@ -909,8 +929,11 @@ export default class KusterInboxPlugin extends Plugin {
       new Notice("Current line is not a recognized link");
       return;
     }
+    const templates = Array.isArray(this.settings.templates) && this.settings.templates.length > 0
+      ? this.settings.templates
+      : DEFAULT_SETTINGS.templates;
     const templatesByType = new Map<string, string>();
-    for (const slot of this.settings.templates) {
+    for (const slot of templates) {
       const tf = this.resolveFile(slot.templatePath);
       if (tf) templatesByType.set(slot.linkType, await this.app.vault.read(tf));
     }
