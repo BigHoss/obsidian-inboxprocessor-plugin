@@ -492,6 +492,31 @@ function renderNote(
   return out;
 }
 
+// Replace all `{{date:...}}` placeholders in a string with their
+// runtime-rendered values, using the supplied compact stamp for the
+// `YYYYMMDDHHmmss` form. `{{title}}` is intentionally left as-is —
+// reprocessed notes aren't authored to have a title, so leaving the
+// placeholder visible tells the user to set the title themselves.
+//
+// This is a smaller helper than `renderNote`: it doesn't fill in
+// destination / url / tags / URL lines (those are LLM-driven and
+// already handled by `spliceFields` in the reprocessor). It's only
+// here so that `{{date:YYYYMMDDHHmmss}}` placeholders left over
+// from the template don't end up as literal strings in reprocessed
+// notes.
+function renderDatePlaceholders(text: string, stamp: string): string {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const dateDashTime = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const isoLike = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const dateOnly = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return text
+    .replace(/\{\{date:YYYYMMDDHHmmss\}\}/g, stamp)
+    .replace(/\{\{date:YYYY-MM-DD HH:mm\}\}/g, dateDashTime)
+    .replace(/\{\{date:YYYY-MM-DDTHH:mm\}\}/g, isoLike)
+    .replace(/\{\{date:YYYY-MM-DD\}\}/g, dateOnly);
+}
+
 // ============================================================================
 // Telegram notify (apprise-shaped POST)
 // ============================================================================
@@ -1483,11 +1508,15 @@ async function readTemplateRequiredFields(
     // Empty = bare `field:`, explicit `""` or `''`, or `[]` / `[ ]`.
     const isEmpty =
       v === "" || v === '""' || v === "''" || v === "[]" || v === "[ ]";
-    // Also treat placeholder-template values like `{{date:...}}` as
-    // "must-fill" — they'll be replaced by the runtime renderer, but a
-    // reprocessed note shouldn't carry the placeholder string forward.
-    const isPlaceholder = /\{\{.*\}\}/.test(v);
-    if (isEmpty || isPlaceholder) {
+    // Detect template placeholders like `{{date:...}}` or `{{title}}`.
+    // These are renderer-managed (the runtime renderer fills them in
+    // when the note is processed), NOT user-fillable. Treating them as
+    // "required" would tell the LLM to fill a date placeholder, which
+    // it can't do — the LLM returns empty, and the reprocessor then
+    // trashes the note. Exclude placeholder fields from the required
+    // list so the LLM is only asked for genuinely-empty fields.
+    const isPlaceholder = /\{\{[^}]+\}\}/.test(v);
+    if (isEmpty && !isPlaceholder) {
       required.push(name);
     }
   }
@@ -1843,7 +1872,14 @@ async function processOneFile(
 
   // Splice filled values into the YAML, preserve the rest of the file.
   const newYaml = spliceFields(fm.yaml, filled);
-  const newText = `---\n${newYaml}\n---\n${fm.body}`;
+  // Render any leftover `{{date:...}}` placeholders in both YAML and
+  // body. Without this step, reprocessed notes still carry literal
+  // `{{date:YYYYMMDDHHmmss}}` strings — same as `renderNote`'s date
+  // pass for new notes. `{{title}}` is intentionally not rendered.
+  const stamp = nowStamp();
+  const renderedYaml = renderDatePlaceholders(newYaml, stamp);
+  const renderedBody = renderDatePlaceholders(fm.body, stamp);
+  const newText = `---\n${renderedYaml}\n---\n${renderedBody}`;
   try {
     await app.vault.modify(file, newText);
     result.processed++;
