@@ -498,8 +498,14 @@ export default class KusterInboxPlugin extends Plugin {
       id: "create-project-from-selection",
       name: "Create project from selection",
       editorCallback: async (editor: Editor, view: MarkdownView) => {
-        const selection = editor.getSelection();
-        await this.createProjectFromSelection(selection);
+        try {
+          const selection = editor.getSelection();
+          await this.createProjectFromSelection(selection);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          console.error("Link Inbox Processor: create-project-from-selection failed", e);
+          new Notice(`Create project failed: ${msg}`, 15000);
+        }
       },
     });
 
@@ -531,8 +537,18 @@ export default class KusterInboxPlugin extends Plugin {
             .setTitle("Convert to project…")
             .setIcon("folder-plus")
             .onClick(async () => {
-              const content = await this.app.vault.cachedRead(file);
-              await this.createProjectFromSelection(content);
+              try {
+                const content = await this.app.vault.cachedRead(file);
+                await this.createProjectFromSelection(content);
+              } catch (e) {
+                const msg = e instanceof Error ? e.message : String(e);
+                // Both: persistent Notice (so the user sees what failed)
+                // and console.error (so the developer can debug).
+                // Notice auto-dismisses after 15s — longer than usual so
+                // it's not missed.
+                console.error("Link Inbox Processor: convert-to-project failed", e);
+                new Notice(`Convert to project failed: ${msg}`, 15000);
+              }
             }),
         );
 
@@ -546,6 +562,64 @@ export default class KusterInboxPlugin extends Plugin {
         );
       }),
     );
+
+    // Command: check projects against templates — shows a modal listing
+    // misaligned projects (v0.5 template) and lets the user apply fixes
+    // per-project via `init-project.py --merge`.
+    this.addCommand({
+      id: "check-projects-against-templates",
+      name: "Check projects against templates",
+      callback: async () => {
+        const py = await findPython();
+        const basePath = this.app.vault.adapter.basePath.replace(/[/\\]+$/, "");
+        const sep = basePath.includes("\\") ? "\\" : "/";
+        const misalignments = await scanProjectsAgainstTemplate(
+          this.app, this.settings, py,
+        );
+        await new Promise<void>((resolve) => {
+          new ProjectCheckModal(this.app, {
+            misalignments,
+            python: py,
+            basePath,
+            sep,
+            onDone: () => resolve(),
+          }).open();
+        });
+        this.refreshStatusBar();
+      },
+    });
+
+    // Command: reprocess inbox subdirectory notes — fills missing
+    // frontmatter fields via LLM, trashes notes that can't be filled.
+    this.addCommand({
+      id: "reprocess-inbox-subdirectories",
+      name: "Reprocess inbox subdirectory notes",
+      callback: async () => {
+        if (!this.settings.llmEnabled || !this.settings.openrouterApiKey) {
+          new Notice(
+            "Enable OpenRouter LLM enrichment in settings first (needs API key + LLM enabled).",
+            10000,
+          );
+          return;
+        }
+        const onProgress = (msg: string) =>
+          new Notice(`Reprocess: ${msg}`, 2500);
+        try {
+          const result = await reprocessInboxSubdirs(
+            this.app, this.settings, null, onProgress,
+          );
+          new Notice(
+            `Inbox reprocess done: ${result.processed} processed, ${result.skipped} already complete, ${result.failed} failed, ${result.trashed} trashed (missing irrecoverable fields).`,
+            12000,
+          );
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          console.error("Link Inbox Processor: reprocess failed", e);
+          new Notice(`Reprocess failed: ${msg}`, 15000);
+        }
+        this.refreshStatusBar();
+      },
+    });
 
     this.addSettingTab(new KusterInboxSettingTab(this.app, this));
 
@@ -600,6 +674,60 @@ export default class KusterInboxPlugin extends Plugin {
           .onClick(async () => {
             const cleared = await clearFailureLog(this.app, this.manifest.dir);
             new Notice(cleared ? "Failure log cleared" : "Nothing to clear");
+          }),
+      );
+      menu.addSeparator();
+      // Project-template check + reprocess — discoverable from the status
+      // bar so NN users (no file-menu event) can find them.
+      menu.addItem((item) =>
+        item
+          .setTitle("Check projects against templates")
+          .setIcon("check-circle")
+          .onClick(async () => {
+            const py = await findPython();
+            const basePath = this.app.vault.adapter.basePath.replace(/[/\\]+$/, "");
+            const sep = basePath.includes("\\") ? "\\" : "/";
+            const misalignments = await scanProjectsAgainstTemplate(
+              this.app, this.settings, py,
+            );
+            await new Promise<void>((resolve) => {
+              new ProjectCheckModal(this.app, {
+                misalignments,
+                python: py,
+                basePath,
+                sep,
+                onDone: () => resolve(),
+              }).open();
+            });
+          }),
+      );
+      menu.addItem((item) =>
+        item
+          .setTitle("Reprocess inbox subdirectory notes")
+          .setIcon("refresh-ccw")
+          .onClick(async () => {
+            if (!this.settings.llmEnabled || !this.settings.openrouterApiKey) {
+              new Notice(
+                "Enable OpenRouter LLM enrichment in settings first.",
+                10000,
+              );
+              return;
+            }
+            try {
+              const onProgress = (msg: string) =>
+                new Notice(`Reprocess: ${msg}`, 2500);
+              const result = await reprocessInboxSubdirs(
+                this.app, this.settings, null, onProgress,
+              );
+              new Notice(
+                `Reprocess: ${result.processed} processed, ${result.skipped} complete, ${result.failed} failed, ${result.trashed} trashed.`,
+                12000,
+              );
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e);
+              console.error("Link Inbox Processor: reprocess failed", e);
+              new Notice(`Reprocess failed: ${msg}`, 15000);
+            }
           }),
       );
       menu.showAtMouseEvent(ev);
@@ -1166,6 +1294,563 @@ URL:
 
 **Captured:** {{date:YYYY-MM-DD HH:mm}}
 `;
+
+// ============================================================================
+// Project-template verifier + inbox reprocessor (v0.5.0)
+// ============================================================================
+
+// Per ADR-001 + per-template defaults, these are the frontmatter fields
+// the plugin considers "must be filled" before a note is considered ready.
+// Empty placeholders in the template files (e.g. `destination:` with no
+// value) define the canonical set. New template = new required field, no
+// code change needed.
+function isFieldEmptyInYaml(yaml: string, fieldName: string): boolean {
+  // Match the field name at the start of a line (with optional whitespace),
+  // followed by `:` and an optional value. We treat the value as "empty" if
+  // it's blank, an empty string `""`, or an empty array `[]`.
+  // Examples that are NOT empty: `priority: medium`, `category: tv-show`,
+  //   `tags: [media]`, `created: 2026-09-01`.
+  // Examples that ARE empty: `url:`, `destination:`, `priority:`,
+  //   `tags: []`.
+  const re = new RegExp(
+    `^${fieldName}\\s*:\\s*(.*)$`,
+    "m",
+  );
+  const m = yaml.match(re);
+  if (!m) return true; // field absent entirely counts as empty
+  const v = m[1].trim();
+  if (v === "") return true; // bare `field:`
+  if (v === '""' || v === "''") return true; // explicit empty string
+  if (v === "[]" || v === "[ ]") return true; // empty array
+  return false;
+}
+
+// Parse YAML frontmatter from a markdown file. Returns null if the file
+// doesn't have a frontmatter block.
+function parseFrontmatter(
+  text: string,
+): { yaml: string; body: string } | null {
+  const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
+  if (!m) return null;
+  const yaml = m[1];
+  const body = text.slice(m[0].length);
+  return { yaml, body };
+}
+
+// Parse the frontmatter of a template file and return the field names whose
+// values are empty placeholders. These are the "must-fill" fields for
+// notes of that template's type.
+async function readTemplateRequiredFields(
+  app: App,
+  templatePath: string,
+): Promise<string[]> {
+  const f = app.vault.getAbstractFileByPath(templatePath);
+  if (!(f instanceof TFile)) return [];
+  const text = await app.vault.cachedRead(f);
+  const fm = parseFrontmatter(text);
+  if (!fm) return [];
+  const required: string[] = [];
+  for (const line of fm.yaml.split(/\r?\n/)) {
+    const m = line.match(/^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$/);
+    if (!m) continue;
+    const [, name, value] = m;
+    const v = value.trim();
+    // Empty = bare `field:`, explicit `""` or `''`, or `[]` / `[ ]`.
+    const isEmpty =
+      v === "" || v === '""' || v === "''" || v === "[]" || v === "[ ]";
+    // Also treat placeholder-template values like `{{date:...}}` as
+    // "must-fill" — they'll be replaced by the runtime renderer, but a
+    // reprocessed note shouldn't carry the placeholder string forward.
+    const isPlaceholder = /\{\{.*\}\}/.test(v);
+    if (isEmpty || isPlaceholder) {
+      required.push(name);
+    }
+  }
+  return required;
+}
+
+// Maps the 5 inbox subdirectory names to their template type. Unknown
+// subdirs are skipped by the reprocessor (they aren't inbox subdirs).
+const INBOX_SUBDIR_TYPES: Record<string, string> = {
+  Links: "link",
+  Tasks: "task",
+  Media: "media",
+  Research: "research",
+  Reference: "reference",
+};
+
+// Result of one project's dry-run scan.
+interface ProjectMisalignment {
+  typeValue: string;       // "3. Coding", "2. Private", etc.
+  projectName: string;     // "Homelab Manager"
+  projectPath: string;     // vault-relative, e.g. "1. Projects/3. Coding/Homelab Manager"
+  projectKey: string;      // auto-derived via deriveProjectKey
+  missingFiles: string[];  // ["v0.1/Plan.md", "CLAUDE.md", ...]
+}
+
+// Run init-project.py --dry-run --merge against one project and parse the
+// output. Returns the list of files that would be created (i.e. missing
+// from the destination).
+async function dryRunProjectScaffold(
+  python: PythonInvoker,
+  basePath: string,
+  sep: string,
+  typeValue: string,
+  projectName: string,
+  projectPath: string,
+): Promise<ProjectMisalignment | null> {
+  const projectKey = deriveProjectKey(projectName);
+  const templateScriptPath = "5. System/Templates/Project Folder Template/scripts/init-project.py";
+  const scriptAbsPath = templateScriptPath.startsWith(basePath)
+    ? templateScriptPath
+    : `${basePath}${sep}${templateScriptPath.replace(/\//g, sep)}`;
+
+  return new Promise<ProjectMisalignment | null>((resolve) => {
+    // @ts-ignore — child_process available in Electron renderer with nodeIntegration
+    const cp = require("child_process");
+    const proc = cp.spawn(
+      python.bin,
+      [...python.args, scriptAbsPath, "--name", projectName, "--key", projectKey,
+       "--dst", projectPath, "--merge", "--dry-run"],
+      { shell: python.shell, windowsHide: true },
+    );
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+    proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    let procError: Error | null = null;
+    proc.on("error", (e: Error) => {
+      procError = e;
+    });
+    proc.on("close", () => {
+      const missing: string[] = [];
+      // init-project.py --dry-run prints lines like:
+      //   RENDER <path>
+      //   COPY   <path>
+      // Each non-empty plan item is a file that would be created or
+      // copied. (Earlier formats used [RENDER] / [COPY] bracketed tags,
+      // but the current init-project.py output uses unbracketed tags.)
+      const re = /^(RENDER|COPY)\s+(.+)$/gm;
+      let match: RegExpExecArray | null;
+      while ((match = re.exec(stdout)) !== null) {
+        missing.push(match[2].trim());
+      }
+      // If the subprocess failed (e.g. python binary not found, or the
+      // script file is missing), surface that as a misalignment so the
+      // user knows verification didn't run for that project.
+      if (procError) {
+        missing.push(`(verification failed: ${procError.message})`);
+      }
+      // Both new destinations AND existing misaligned ones produce the
+      // same RENDER/COPY output. The discriminator is whether the
+      // destination directory exists at all — but for the misalignment
+      // report we treat both as "this project needs scaffolding".
+      resolve({
+        typeValue,
+        projectName,
+        projectPath,
+        projectKey,
+        missingFiles: missing,
+      });
+    });
+  });
+}
+
+// Walk all projects under settings.projectsRoot, run dry-run against each,
+// return the list of misaligned ones.
+async function scanProjectsAgainstTemplate(
+  app: App,
+  settings: KusterInboxSettings,
+  python: PythonInvoker | null,
+): Promise<ProjectMisalignment[]> {
+  if (!python) return [];
+  const basePath = app.vault.adapter.basePath.replace(/[/\\]+$/, "");
+  const sep = basePath.includes("\\") ? "\\" : "/";
+  const root = settings.projectsRoot.replace(/[/\\]+$/, "");
+  if (!(await app.vault.adapter.exists(root))) return [];
+  const listing = await app.vault.adapter.list(root);
+  const misaligned: ProjectMisalignment[] = [];
+  for (const dirEntry of listing) {
+    if (await app.vault.adapter.exists(dirEntry.path) === false) continue;
+    // dirEntry.path is the project-type subfolder (e.g. "1. Projects/3. Coding")
+    const typeName = dirEntry.name;
+    const subListing = await app.vault.adapter.list(dirEntry.path);
+    for (const projEntry of subListing) {
+      const projName = projEntry.name;
+      if (await app.vault.adapter.exists(projEntry.path) === false) continue;
+      const result = await dryRunProjectScaffold(
+        python, basePath, sep, typeName, projName, projEntry.path,
+      );
+      if (result && result.missingFiles.length > 0) {
+        misaligned.push(result);
+      }
+    }
+  }
+  return misaligned;
+}
+
+// ============================================================================
+// Modal: display the misalignment report and let the user trigger fixes
+// ============================================================================
+
+class ProjectCheckModal extends Modal {
+  private app: App;
+  private misalignments: ProjectMisalignment[];
+  private python: PythonInvoker | null;
+  private basePath: string;
+  private sep: string;
+  private onDone: (results: { fixed: string[]; skipped: string[]; failed: { name: string; error: string }[] }) => void;
+
+  constructor(
+    app: App,
+    opts: {
+      misalignments: ProjectMisalignment[];
+      python: PythonInvoker | null;
+      basePath: string;
+      sep: string;
+      onDone: (r: ProjectMisalignment[]) => void;
+    },
+  ) {
+    super(app);
+    this.app = app;
+    this.misalignments = opts.misalignments;
+    this.python = opts.python;
+    this.basePath = opts.basePath;
+    this.sep = opts.sep;
+    this.onDone = opts.onDone as ProjectCheckModal["onDone"];
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Project template check" });
+
+    if (this.misalignments.length === 0) {
+      contentEl.createEl("p", {
+        text: "All projects under 1. Projects/ match the v0.5 template. Nothing to fix.",
+        cls: "setting-item-description",
+      });
+      const closeBtn = contentEl.createEl("button", { text: "Close" });
+      closeBtn.addEventListener("click", () => {
+        this.close();
+        this.onDone({ fixed: [], skipped: [], failed: [] });
+      });
+      return;
+    }
+
+    contentEl.createEl("p", {
+      text:
+        `${this.misalignments.length} project(s) are misaligned against the v0.5 template. ` +
+        `Click a project to apply fixes (init-project.py --merge; safe to re-run).`,
+      cls: "setting-item-description",
+    });
+
+    const list = contentEl.createDiv({ cls: "kip-check-list" });
+    list.style.cssText = "margin-top: 12px; max-height: 50vh; overflow-y: auto;";
+    for (const m of this.misalignments) {
+      const row = list.createDiv({ cls: "kip-check-row" });
+      row.style.cssText =
+        "padding: 8px 10px; margin-bottom: 6px; border: 1px solid var(--background-modifier-border); border-radius: 6px;";
+      const header = row.createDiv();
+      header.createEl("strong", { text: `${m.typeValue}/${m.projectName}` });
+      header.createEl("br");
+      const missingEl = header.createEl("span", { text: "Missing: " });
+      missingEl.createEl("code", {
+        text: m.missingFiles.length <= 4
+          ? m.missingFiles.join(", ")
+          : m.missingFiles.slice(0, 4).join(", ") + ` (+${m.missingFiles.length - 4} more)`,
+      });
+      const actions = row.createDiv();
+      actions.style.cssText = "margin-top: 6px; display: flex; gap: 6px;";
+      const fixBtn = actions.createEl("button", { text: "Apply fixes" });
+      fixBtn.addEventListener("click", async () => {
+        fixBtn.disabled = true;
+        fixBtn.setText("Applying…");
+        const result = await applyProjectFix(this.app, this.python, this.basePath, this.sep, m);
+        fixBtn.setText(result.ok ? "Fixed ✓" : `Failed: ${result.error}`);
+      });
+      const skipBtn = actions.createEl("button", { text: "Skip" });
+      skipBtn.addEventListener("click", () => {
+        this.close();
+        this.onDone({ fixed: [], skipped: [m.projectPath], failed: [] });
+      });
+    }
+
+    const closeAllBtn = contentEl.createEl("button", { text: "Close" });
+    closeAllBtn.style.marginTop = "12px";
+    closeAllBtn.addEventListener("click", () => {
+      this.close();
+      this.onDone({ fixed: [], skipped: [], failed: [] });
+    });
+  }
+
+  onClose(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+  }
+}
+
+// Run init-project.py --merge (no --dry-run) for one project. Returns
+// {ok: true} on success or {ok: false, error: string} on failure.
+async function applyProjectFix(
+  app: App,
+  python: PythonInvoker | null,
+  basePath: string,
+  sep: string,
+  m: ProjectMisalignment,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!python) return { ok: false, error: "Python not found" };
+  const templateScriptPath = "5. System/Templates/Project Folder Template/scripts/init-project.py";
+  const scriptAbsPath = templateScriptPath.startsWith(basePath)
+    ? templateScriptPath
+    : `${basePath}${sep}${templateScriptPath.replace(/\//g, sep)}`;
+  return new Promise((resolve) => {
+    // @ts-ignore
+    const cp = require("child_process");
+    const proc = cp.spawn(
+      python.bin,
+      [...python.args, scriptAbsPath, "--name", m.projectName, "--key", m.projectKey,
+       "--dst", m.projectPath, "--merge"],
+      { shell: python.shell, windowsHide: true, cwd: basePath,
+        env: { ...process.env, OBSIDIAN_VAULT_PATH: basePath } },
+    );
+    let stderr = "";
+    proc.stdout.on("data", () => {});
+    proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    proc.on("error", (e: Error) => resolve({ ok: false, error: e.message }));
+    proc.on("close", (code: number | null) => {
+      if (code === 0) resolve({ ok: true });
+      else resolve({ ok: false, error: `exit ${code}: ${stderr.slice(-300)}` });
+    });
+  });
+}
+
+// ============================================================================
+// Inbox subdirectory reprocessor
+// ============================================================================
+
+interface ReprocessResult {
+  processed: number;       // successfully filled
+  skipped: number;         // already had all required fields
+  failed: number;          // LLM call or write failed
+  trashed: number;         // moved to .trash/ because unrecoverable
+}
+
+// Walk 0. Inbox/{Links,Tasks,Media,Research,Reference}/, check each .md
+// against its template's required fields, fill missing via LLM, save.
+async function reprocessInboxSubdirs(
+  app: App,
+  settings: KusterInboxSettings,
+  python: PythonInvoker | null,
+  onProgress?: (msg: string) => void,
+): Promise<ReprocessResult> {
+  const result: ReprocessResult = { processed: 0, skipped: 0, failed: 0, trashed: 0 };
+  if (!settings.llmEnabled || !settings.openrouterApiKey) {
+    // Without the LLM we can't fill missing fields; just count + skip.
+  }
+  const inboxRoot = "0. Inbox";
+  if (!(await app.vault.adapter.exists(inboxRoot))) return result;
+
+  for (const [subdir, ttype] of Object.entries(INBOX_SUBDIR_TYPES)) {
+    const subdirPath = `${inboxRoot}/${subdir}`;
+    if (!(await app.vault.adapter.exists(subdirPath))) continue;
+    const listing = await app.vault.adapter.list(subdirPath);
+    // adapter.list() returns TAbstractFile[]; we want only files whose
+    // adapter.exists returns true (this filters out folders whose paths
+    // appear in the listing). Async filter via map+reduce.
+    const mdFiles: TFile[] = [];
+    for (const l of listing) {
+      if (!l.name.endsWith(".md")) continue;
+      if (!(await app.vault.adapter.exists(l.path))) continue;
+      const abs = app.vault.getAbstractFileByPath(l.path);
+      if (abs instanceof TFile) mdFiles.push(abs);
+    }
+
+    // Determine required fields for this type from the configured template
+    const templatePath = settings.templates.find(
+      (t) => t.linkType === ttype,
+    )?.templatePath;
+    if (!templatePath) continue;
+    const requiredFields = await readTemplateRequiredFields(app, templatePath);
+    if (requiredFields.length === 0) continue;
+
+    for (const file of mdFiles) {
+      await processOneFile(app, file, ttype, requiredFields, settings, python, onProgress, result);
+    }
+  }
+  return result;
+}
+
+async function processOneFile(
+  app: App,
+  file: TFile,
+  ttype: string,
+  requiredFields: string[],
+  settings: KusterInboxSettings,
+  python: PythonInvoker | null,
+  onProgress: ((msg: string) => void) | undefined,
+  result: ReprocessResult,
+): Promise<void> {
+  onProgress?.(`Reprocessing ${file.path}…`);
+  const text = await app.vault.cachedRead(file);
+  const fm = parseFrontmatter(text);
+  if (!fm) {
+    // No frontmatter — skip; the template has required fields so this file
+    // doesn't even match the template shape.
+    result.skipped++;
+    return;
+  }
+  const emptyFields = requiredFields.filter((f) => isFieldEmptyInYaml(fm.yaml, f));
+  if (emptyFields.length === 0) {
+    result.skipped++;
+    return;
+  }
+
+  // Try the LLM. If it can't fill the value (e.g. URL truly missing for
+  // a Link note), we trash the file rather than half-fill it.
+  let filled: Record<string, string> = {};
+  if (settings.llmEnabled && settings.openrouterApiKey) {
+    filled = await tryFillFieldsViaLlm(app, settings, file, ttype, emptyFields);
+  }
+
+  // Verify all the originally-empty fields are now filled. Anything still
+  // missing after the LLM call means we can't safely write this file —
+  // move to .trash/ for human triage.
+  const stillEmpty = emptyFields.filter((f) => !filled[f] || filled[f].length === 0);
+  if (stillEmpty.length > 0) {
+    await trashFile(app, file, stillEmpty);
+    result.trashed++;
+    return;
+  }
+
+  // Splice filled values into the YAML, preserve the rest of the file.
+  const newYaml = spliceFields(fm.yaml, filled);
+  const newText = `---\n${newYaml}\n---\n${fm.body}`;
+  try {
+    await app.vault.modify(file, newText);
+    result.processed++;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(`Link Inbox Processor: failed to modify ${file.path}`, e);
+    await appendFailureLog(app, { dir: ".obsidian/plugins/kuster-inbox-processor" }, file.path, msg);
+    result.failed++;
+  }
+}
+
+function spliceFields(yaml: string, filled: Record<string, string>): string {
+  const lines = yaml.split(/\r?\n/);
+  const out: string[] = [];
+  const written = new Set<string>();
+  for (const line of lines) {
+    const m = line.match(/^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$/);
+    if (m) {
+      const [, name, value] = m;
+      if (filled[name] !== undefined) {
+        const v = filled[name];
+        // Preserve the original quoting style if present.
+        if (value.startsWith('"') && value.endsWith('"')) {
+          out.push(`${name}: "${v}"`);
+        } else if (value.startsWith("'") && value.endsWith("'")) {
+          out.push(`${name}: '${v}'`);
+        } else if (value.startsWith("[") && value.endsWith("]")) {
+          // Tags-like field. We won't get a tag here from the LLM usually,
+          // so if the LLM provided tags we'll pass them through as
+          // comma-separated text — caller should pre-format.
+          out.push(`${name}: ${v}`);
+        } else {
+          out.push(`${name}: ${v}`);
+        }
+        written.add(name);
+      } else {
+        out.push(line);
+      }
+    } else {
+      out.push(line);
+    }
+  }
+  // Any fields the LLM filled that didn't appear in the original YAML get
+  // appended at the end (rare — happens for fields missing entirely).
+  for (const name of Object.keys(filled)) {
+    if (!written.has(name)) {
+      out.push(`${name}: ${filled[name]}`);
+    }
+  }
+  return out.join("\n");
+}
+
+async function tryFillFieldsViaLlm(
+  app: App,
+  settings: KusterInboxSettings,
+  file: TFile,
+  ttype: string,
+  fields: string[],
+): Promise<Record<string, string>> {
+  // Use the existing enrichWithLlm-style call, but ask for ONLY the
+  // missing fields. We piggyback on the same OpenRouter endpoint.
+  const systemPrompt =
+    `You classify a ${ttype} note from an Obsidian PARA vault. ` +
+    `For each field name below, return the value that should fill it. ` +
+    `If you genuinely cannot determine the value (e.g. the URL is not ` +
+    `in the file body), return an empty string for that field. ` +
+    `Return ONLY a JSON object like {"field1": "value1", "field2": "value2"}. ` +
+    `Fields: ${fields.join(", ")}.`;
+
+  const text = await app.vault.cachedRead(file);
+  const userPrompt = `File path: ${file.path}\n\nFile contents:\n${text}`;
+
+  try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${settings.openrouterApiKey}`,
+    };
+    if (settings.openrouterReferer) headers["HTTP-Referer"] = settings.openrouterReferer;
+    if (settings.openrouterAppName) headers["X-Title"] = settings.openrouterAppName;
+
+    const r = await requestUrl({
+      url: "https://openrouter.ai/api/v1/chat/completions",
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: settings.openrouterModel,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        temperature: 0.2,
+      }),
+      throw: false,
+    });
+    if (r.status < 200 || r.status >= 300) return {};
+    const reply = r.json?.choices?.[0]?.message?.content ?? "";
+    const json = reply.match(/\{[\s\S]*\}/)?.[0];
+    if (!json) return {};
+    const parsed = JSON.parse(json);
+    const out: Record<string, string> = {};
+    for (const field of fields) {
+      const v = parsed[field];
+      if (typeof v === "string" && v.trim().length > 0) {
+        out[field] = v.trim();
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+async function trashFile(app: App, file: TFile, missingFields: string[]): Promise<void> {
+  const trashDir = ".trash";
+  if (!(await app.vault.adapter.exists(trashDir))) {
+    await app.vault.adapter.mkdir(trashDir);
+  }
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const baseName = file.basename;
+  const destPath = `${trashDir}/${ts}__${baseName}__missing-${missingFields.join(",")}.md`;
+  await app.vault.rename(file, destPath);
+  console.warn(
+    `Link Inbox Processor: trashed ${file.path} (missing: ${missingFields.join(", ")}) -> ${destPath}`,
+  );
+}
 
 // ============================================================================
 // Settings tab
@@ -1874,18 +2559,14 @@ class ProjectScaffoldModal extends Modal {
       this.selectedTypeIdx = parseInt(typeSelect.value, 10) || 0;
     });
 
-    // Project name + derived key
-    const nameSetting = new Setting(contentEl).setName("Project name");
-    let nameValue = "";
-    let keyValue = "";
-    nameSetting.addText((t) => {
-      t.setPlaceholder("My New Project").onChange((v) => {
-        nameValue = v;
-        keyValue = deriveProjectKey(v);
-        keyInput.value = keyValue;
-        previewEl.setText(this.previewPath());
-      });
-    });
+    // Preview line is referenced by the nameInput.onChange callback below,
+    // so it must be created before the name Setting block. Same for the
+    // key input. (Hoisting `let`/`const` doesn't work inside closures that
+    // capture by reference, so we declare top-down.)
+    const previewEl = contentEl.createEl("p");
+    previewEl.style.cssText =
+      "font-family: var(--font-monospace); font-size: 12px; padding: 6px 8px; background: var(--background-secondary); border-radius: 4px; margin-top: 8px;";
+
     const keySetting = new Setting(contentEl)
       .setName("Project key")
       .setDesc("Auto-derived from name (^[A-Z][A-Z0-9-]{1,15}$). Edit if you want.");
@@ -1898,11 +2579,19 @@ class ProjectScaffoldModal extends Modal {
       keyValue = keyInput.value;
     });
 
-    // Preview + buttons
-    const previewEl = contentEl.createEl("p");
-    previewEl.style.cssText =
-      "font-family: var(--font-monospace); font-size: 12px; padding: 6px 8px; background: var(--background-secondary); border-radius: 4px; margin-top: 8px;";
-    previewEl.setText(this.previewPath());
+    // Project name — must come AFTER keyInput and previewEl so the
+    // captured refs are initialised when onChange fires.
+    const nameSetting = new Setting(contentEl).setName("Project name");
+    let nameValue = "";
+    let keyValue = "";
+    nameSetting.addText((t) => {
+      t.setPlaceholder("My New Project").onChange((v) => {
+        nameValue = v;
+        keyValue = deriveProjectKey(v);
+        keyInput.value = keyValue;
+        previewEl.setText(this.previewPath());
+      });
+    });
 
     const initialNote = contentEl.createEl("p", {
       text:
