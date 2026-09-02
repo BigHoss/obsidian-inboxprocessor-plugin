@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.6.5](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.4...v0.6.5) (2026-09-02)
+
+
+### Bug Fixes
+
+* reprocessor no longer trashes notes for un-fillable date fields ([b91589b](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/b91589b5b2e66e2c78ef590a881da15b11bc52d5))
+
 ### [0.6.4](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.3...v0.6.4) (2026-09-02)
 
 
