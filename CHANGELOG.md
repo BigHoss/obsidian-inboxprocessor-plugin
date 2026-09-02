@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.6.2](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.1...v0.6.2) (2026-09-02)
+
+
+### Bug Fixes
+
+* defensive guard for settings.templates in processInbox + processSingleLine ([df038d8](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/df038d878c3110347ff02f75c257f47f25b1a4d7))
+
 ### [0.6.1](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.0...v0.6.1) (2026-09-02)
 
 
