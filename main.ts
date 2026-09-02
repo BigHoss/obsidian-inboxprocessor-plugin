@@ -86,6 +86,11 @@ interface KusterInboxSettings {
   projectsRoot: string;
   // Vault-relative path to init-project.py (the Python scaffolding tool).
   templateScriptPath: string;
+  // Debug mode — when on, every console.log/info/warn/error call
+  // (including the ones in catch blocks) also gets written to
+  // debug.log in the plugin's app-data directory. Off by default;
+  // turn on for triage / bug reports.
+  debugEnabled: boolean;
 }
 
 const DEFAULT_SETTINGS: KusterInboxSettings = {
@@ -135,6 +140,7 @@ const DEFAULT_SETTINGS: KusterInboxSettings = {
   archiveRoot: "4. Archive",
   projectsRoot: "1. Projects",
   templateScriptPath: "5. System/Templates/Project Folder Template/scripts/init-project.py",
+  debugEnabled: false,
 };
 
 // ============================================================================
@@ -353,7 +359,21 @@ async function enrichWithLlm(
       }),
       throw: false,
     };
+    appendDebugLog(
+      app,
+      ".obsidian/plugins/kuster-inbox-processor",
+      "DEBUG",
+      `enrichWithLlm request: url=${url}, model=${settings.openrouterModel}`,
+      settings.debugEnabled,
+    );
     const r = await requestUrl(body);
+    appendDebugLog(
+      app,
+      ".obsidian/plugins/kuster-inbox-processor",
+      "DEBUG",
+      `enrichWithLlm response: status=${r.status}, body=${(r.text ?? "").slice(0, 200)}`,
+      settings.debugEnabled,
+    );
     if (r.status < 200 || r.status >= 300) {
       throw new Error(`OpenRouter HTTP ${r.status}`);
     }
@@ -386,6 +406,14 @@ async function enrichWithLlm(
       ? requestedDest
       : slot.defaultDestination;
 
+    appendDebugLog(
+      app,
+      ".obsidian/plugins/kuster-inbox-processor",
+      "DEBUG",
+      `enrichWithLlm ok: url=${url}, type=${slot.linkType}, dest=${safeDest}`,
+      settings.debugEnabled,
+    );
+
     return {
       refinedTitle: String(parsed.refinedTitle ?? parsed.title ?? "Untitled").trim(),
       suggestedDestination: safeDest,
@@ -400,6 +428,13 @@ async function enrichWithLlm(
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    appendDebugLog(
+      app,
+      ".obsidian/plugins/kuster-inbox-processor",
+      "ERROR",
+      `enrichWithLlm failed: url=${url} — ${msg}`,
+      settings.debugEnabled,
+    );
     throw new Error(`LLM enrichment failed: ${msg}`);
   }
 }
@@ -535,7 +570,10 @@ export default class KusterInboxPlugin extends Plugin {
           await this.createProjectFromSelection(selection);
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
-          console.error("Link Inbox Processor: create-project-from-selection failed", e);
+          this.pluginLog(
+            "ERROR",
+            `create-project-from-selection failed: ${msg}`,
+          );
           new Notice(`Create project failed: ${msg}`, 15000);
         }
       },
@@ -575,10 +613,14 @@ export default class KusterInboxPlugin extends Plugin {
               } catch (e) {
                 const msg = e instanceof Error ? e.message : String(e);
                 // Both: persistent Notice (so the user sees what failed)
-                // and console.error (so the developer can debug).
+                // and pluginLog ERROR (so the developer can debug — also
+                // goes to debug.log when settings.debugEnabled is on).
                 // Notice auto-dismisses after 15s — longer than usual so
                 // it's not missed.
-                console.error("Link Inbox Processor: convert-to-project failed", e);
+                this.pluginLog(
+                  "ERROR",
+                  `convert-to-project failed: ${msg}`,
+                );
                 new Notice(`Convert to project failed: ${msg}`, 15000);
               }
             }),
@@ -644,7 +686,7 @@ export default class KusterInboxPlugin extends Plugin {
           );
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
-          console.error("Link Inbox Processor: reprocess failed", e);
+          this.pluginLog("ERROR", `reprocess failed: ${msg}`);
           new Notice(`Reprocess failed: ${msg}`, 15000);
         }
         this.refreshStatusBar();
@@ -707,6 +749,34 @@ export default class KusterInboxPlugin extends Plugin {
           }),
       );
       menu.addSeparator();
+      menu.addItem((item) =>
+        item
+          .setTitle("View debug log")
+          .setIcon("file-cog")
+          .onClick(async () => {
+            const text = await readDebugLog(this.app, this.manifest.dir);
+            if (text === null) {
+              new Notice(
+                "Debug log is empty (or debug mode is off and no entries yet).",
+                5000,
+              );
+              return;
+            }
+            const dir = await pluginDataDir(this.app, this.manifest.dir);
+            const logPath = `${dir}/debug.log`;
+            await this.app.workspace.openLinkText(logPath, "", false);
+          }),
+      );
+      menu.addItem((item) =>
+        item
+          .setTitle("Clear debug log")
+          .setIcon("eraser")
+          .onClick(async () => {
+            const cleared = await clearDebugLog(this.app, this.manifest.dir);
+            new Notice(cleared ? "Debug log cleared" : "Nothing to clear");
+          }),
+      );
+      menu.addSeparator();
       // Project-template check + reprocess — discoverable from the status
       // bar so NN users (no file-menu event) can find them.
       menu.addItem((item) =>
@@ -753,7 +823,7 @@ export default class KusterInboxPlugin extends Plugin {
               );
             } catch (e) {
               const msg = e instanceof Error ? e.message : String(e);
-              console.error("Link Inbox Processor: reprocess failed", e);
+              this.pluginLog("ERROR", `reprocess failed: ${msg}`);
               new Notice(`Reprocess failed: ${msg}`, 15000);
             }
           }),
@@ -812,6 +882,31 @@ export default class KusterInboxPlugin extends Plugin {
     this.statusBarEl.setText(`Inbox: ${pending}${lastRun}`);
   }
 
+  /**
+   * Write to console + (when settings.debugEnabled) append to debug.log.
+   * Safe to call from anywhere; never throws.
+   */
+  pluginLog(level: DebugLevel, msg: string): void {
+    try {
+      // Mirror to console unconditionally — Obsidian's console is always
+      // available and that's where you'll see it during development.
+      console[level === "DEBUG" ? "debug" : level === "INFO" ? "info" : level === "WARN" ? "warn" : "error"](msg);
+      if (this.settings.debugEnabled) {
+        // Fire-and-forget; appendDebugLog swallows its own errors and
+        // short-circuits when debug mode is off.
+        void appendDebugLog(
+          this.app,
+          this.manifest.dir,
+          level,
+          msg,
+          this.settings.debugEnabled,
+        );
+      }
+    } catch {
+      // Never let logging take down the host command.
+    }
+  }
+
   async countPending(): Promise<number> {
     const file = this.resolveFile(this.settings.inboxFile);
     if (!file) return 0;
@@ -851,6 +946,11 @@ export default class KusterInboxPlugin extends Plugin {
       .map((l) => l.trim())
       .filter((l) => l.length > 0);
 
+    this.pluginLog(
+      "INFO",
+      `processInbox start: file=${this.settings.inboxFile}, ${lines.length} line(s) below marker, cap=${this.settings.maxLinksPerRun}, llm=${this.settings.llmEnabled ? "on" : "off"}`,
+    );
+
     if (lines.length === 0) {
       new Notice("Inbox is clean — no links to process");
       this.refreshStatusBar();
@@ -886,9 +986,17 @@ export default class KusterInboxPlugin extends Plugin {
       const line = lines[i];
       const parsed = parseLine(line);
       if (!parsed) {
+        this.pluginLog(
+          "DEBUG",
+          `processInbox skip unparseable line ${i + 1}/${cap}: ${line.slice(0, 80)}`,
+        );
         survivors.push(line);
         continue;
       }
+      this.pluginLog(
+        "DEBUG",
+        `processInbox line ${i + 1}/${cap} parsed: url=${parsed.url}, title=${parsed.title ?? "(none)"}`,
+      );
       try {
         const onProgress =
           this.settings.showFetchNotices && !silent
@@ -897,15 +1005,18 @@ export default class KusterInboxPlugin extends Plugin {
         const result = await this.processOne(parsed, templatesByType, defaultTemplate, onProgress);
         if (result === null) {
           // user chose Skip — link stays in inbox for next run
+          this.pluginLog("INFO", `processInbox line ${i + 1}/${cap}: user skipped ${parsed.url}`);
           survivors.push(line);
           skipCount++;
         } else if (typeof result === "object" && "abort" in result) {
           // user chose Abort — stop the entire batch here
+          this.pluginLog("INFO", `processInbox line ${i + 1}/${cap}: user aborted at ${parsed.url}`);
           for (let j = i; j < cap; j++) survivors.push(lines[j]);
           for (let j = cap; j < lines.length; j++) survivors.push(lines[j]);
           aborted = true;
           break;
         } else {
+          this.pluginLog("INFO", `processInbox line ${i + 1}/${cap}: created ${result}`);
           processedLines.push(line);
           okCount++;
         }
@@ -915,6 +1026,7 @@ export default class KusterInboxPlugin extends Plugin {
         survivors.push(line);
         failCount++;
         await appendFailureLog(this.app, this.manifest, parsed.url, msg);
+        this.pluginLog("ERROR", `processInbox line ${i + 1}/${cap}: ${parsed.url} — ${msg}`);
         await notifyError(this.settings, `Failed: ${parsed.url}\n${msg}`);
       }
     }
@@ -927,6 +1039,10 @@ export default class KusterInboxPlugin extends Plugin {
     await this.app.vault.modify(file, updated);
 
     this.lastRunAt = Date.now();
+    this.pluginLog(
+      "INFO",
+      `processInbox done: ok=${okCount}, skipped=${skipCount}, failed=${failCount}, deferred=${aborted ? 0 : Math.max(0, lines.length - cap)}, aborted=${aborted}`,
+    );
     if (!silent) {
       new Notice(
         `Inbox: ${okCount} processed, ${skipCount} skipped, ${failCount} kept for retry${
@@ -1733,6 +1849,8 @@ async function processOneFile(
     result.processed++;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    // Free function — can't use this.pluginLog. console.error stays;
+    // debug log entries for free-function paths aren't supported yet.
     console.error(`Link Inbox Processor: failed to modify ${file.path}`, e);
     await appendFailureLog(app, { dir: ".obsidian/plugins/kuster-inbox-processor" }, file.path, msg);
     result.failed++;
@@ -2361,6 +2479,91 @@ class KusterInboxSettingTab extends PluginSettingTab {
     })();
 
     // ---------------------------------------------------------------------
+    // Debug (toggle + log file outside the vault)
+    // ---------------------------------------------------------------------
+    containerEl.createEl("h3", { text: "Debug" });
+    containerEl.createEl("p", {
+      text:
+        "When Debug is on, every plugin log line (including errors) is " +
+        "appended to debug.log in the OS app-data dir alongside the failure " +
+        "log. Off by default — turn on for triage or to file a useful bug " +
+        "report. Console output is unaffected by this toggle.",
+      cls: "setting-item-description",
+    });
+    new Setting(containerEl)
+      .setName("Enable debug logging")
+      .setDesc(
+        "Off by default. When on, plugin activity is mirrored to debug.log.",
+      )
+      .addToggle((tg) =>
+        tg
+          .setValue(this.plugin.settings.debugEnabled)
+          .onChange(async (v) => {
+            this.plugin.settings.debugEnabled = v;
+            await this.plugin.saveData(this.plugin.settings);
+            new Notice(
+              v
+                ? "Debug logging enabled. New entries go to debug.log."
+                : "Debug logging disabled.",
+              5000,
+            );
+          }),
+      );
+    new Setting(containerEl)
+      .setName("View debug log")
+      .setDesc("Opens debug.log in Obsidian if it has any entries.")
+      .addButton((b) =>
+        b.setButtonText("View").onClick(async () => {
+          const text = await readDebugLog(
+            this.plugin.app,
+            this.plugin.manifest.dir,
+          );
+          if (text === null) {
+            new Notice("Debug log is empty");
+            return;
+          }
+          const dir = await pluginDataDir(
+            this.plugin.app,
+            this.plugin.manifest.dir,
+          );
+          const logPath = `${dir}/debug.log`;
+          await this.plugin.app.workspace.openLinkText(logPath, "", false);
+        }),
+      )
+      .addButton((b) =>
+        b
+          .setButtonText("Clear")
+          .setWarning()
+          .onClick(async () => {
+            const cleared = await clearDebugLog(
+              this.plugin.app,
+              this.plugin.manifest.dir,
+            );
+            new Notice(cleared ? "Debug log cleared" : "Nothing to clear");
+          }),
+      );
+    const debugPathSetting = new Setting(containerEl)
+      .setName("Debug log file location")
+      .setDesc("Computed at runtime — shown for reference.");
+    debugPathSetting.descEl.createEl("code", {
+      text: "(populated when debug mode writes its first entry)",
+    });
+    (async () => {
+      try {
+        const dir = await pluginDataDir(
+          this.plugin.app,
+          this.plugin.manifest.dir,
+        );
+        debugPathSetting.descEl.empty();
+        debugPathSetting.descEl.createEl("code", {
+          text: `${dir}/debug.log`,
+        });
+      } catch {
+        // best-effort
+      }
+    })();
+
+    // ---------------------------------------------------------------------
     // Notifications
     // ---------------------------------------------------------------------
     containerEl.createEl("h3", { text: "Notifications" });
@@ -2885,6 +3088,67 @@ async function readFailureLog(app: App, manifestDir: string): Promise<string | n
   const logPath = `${dir}/process-failures.log`;
   if (!(await app.vault.adapter.exists(logPath))) return null;
   return await app.vault.adapter.read(logPath);
+}
+
+// ============================================================================
+// Debug log — append-only trace of plugin activity when settings.debugEnabled
+// is true. Same on-disk directory as the failure log; different filename.
+// One line per entry: ISO timestamp + level + message. Multi-line messages
+// are joined with \u23ce to keep the file greppable.
+// ============================================================================
+
+const DEBUG_LOG_FILE = "debug.log";
+type DebugLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
+
+function formatDebugLine(level: DebugLevel, msg: string): string {
+  const ts = new Date().toISOString();
+  // Collapse multi-line messages so each log entry is one line.
+  const flat = String(msg).replace(/\r?\n/g, "\u23ce");
+  return `${ts} [${level}] ${flat}\n`;
+}
+
+async function appendDebugLog(
+  app: App,
+  manifestDir: string,
+  level: DebugLevel,
+  msg: string,
+  enabled: boolean,
+): Promise<void> {
+  if (!enabled) return; // no-op when debug mode is off
+  try {
+    const dir = await pluginDataDir(app, manifestDir);
+    const logPath = `${dir}/${DEBUG_LOG_FILE}`;
+    const line = formatDebugLine(level, msg);
+    if (await app.vault.adapter.exists(logPath)) {
+      const existing = await app.vault.adapter.read(logPath);
+      await app.vault.adapter.write(logPath, existing + line);
+    } else {
+      await app.vault.adapter.write(logPath, line);
+    }
+  } catch {
+    // Logging must never crash the host command. Swallow.
+  }
+}
+
+async function readDebugLog(
+  app: App,
+  manifestDir: string,
+): Promise<string | null> {
+  const dir = await pluginDataDir(app, manifestDir);
+  const logPath = `${dir}/${DEBUG_LOG_FILE}`;
+  if (!(await app.vault.adapter.exists(logPath))) return null;
+  return await app.vault.adapter.read(logPath);
+}
+
+async function clearDebugLog(
+  app: App,
+  manifestDir: string,
+): Promise<boolean> {
+  const dir = await pluginDataDir(app, manifestDir);
+  const logPath = `${dir}/${DEBUG_LOG_FILE}`;
+  if (!(await app.vault.adapter.exists(logPath))) return false;
+  await app.vault.adapter.remove(logPath);
+  return true;
 }
 
 // ============================================================================
