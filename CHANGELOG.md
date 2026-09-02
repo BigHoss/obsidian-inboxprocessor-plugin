@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.6.1](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.0...v0.6.1) (2026-09-02)
+
+
+### Features
+
+* project-template check + inbox reprocessor (v0.5.0 add-ons) ([2261a03](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/2261a0396284b3fb660a1b99210b99f636d31a94))
+
 ## [0.6.0](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.5.0...v0.6.0) (2026-09-01)
 
 
