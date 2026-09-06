@@ -2,6 +2,8 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.6.7](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.6...v0.6.7) (2026-09-06)
+
 ### [0.6.6](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.5...v0.6.6) (2026-09-02)
 
 
