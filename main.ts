@@ -812,8 +812,7 @@ export default class KusterInboxPlugin extends Plugin {
               new Notice("No failures recorded yet");
               return;
             }
-            const dir = await pluginDataDir(this.app, this.manifest.dir);
-            await this.app.workspace.openLinkText(`${dir}/process-failures.log`, "", false);
+            new LogViewerModal(this.app, "Failure log", text).open();
           }),
       );
       menu.addItem((item) =>
@@ -839,9 +838,7 @@ export default class KusterInboxPlugin extends Plugin {
               );
               return;
             }
-            const dir = await pluginDataDir(this.app, this.manifest.dir);
-            const logPath = `${dir}/debug.log`;
-            await this.app.workspace.openLinkText(logPath, "", false);
+            new LogViewerModal(this.app, "Debug log", text).open();
           }),
       );
       menu.addItem((item) =>
@@ -2470,7 +2467,7 @@ class KusterInboxSettingTab extends PluginSettingTab {
     });
     new Setting(containerEl)
       .setName("View failure log")
-      .setDesc("Opens the log in Obsidian if it has any entries.")
+      .setDesc("Opens the log in a modal (the file lives outside the vault, so Obsidian can't open it directly).")
       .addButton((b) =>
         b.setButtonText("View").onClick(async () => {
           const text = await readFailureLog(
@@ -2481,12 +2478,7 @@ class KusterInboxSettingTab extends PluginSettingTab {
             new Notice("No failures recorded yet");
             return;
           }
-          const dir = await pluginDataDir(
-            this.plugin.app,
-            this.plugin.manifest.dir,
-          );
-          const logPath = `${dir}/process-failures.log`;
-          await this.plugin.app.workspace.openLinkText(logPath, "", false);
+          new LogViewerModal(this.plugin.app, "Failure log", text).open();
         }),
       )
       .addButton((b) =>
@@ -2555,7 +2547,7 @@ class KusterInboxSettingTab extends PluginSettingTab {
       );
     new Setting(containerEl)
       .setName("View debug log")
-      .setDesc("Opens debug.log in Obsidian if it has any entries.")
+      .setDesc("Opens debug.log in a modal (the file lives outside the vault, so Obsidian can't open it directly).")
       .addButton((b) =>
         b.setButtonText("View").onClick(async () => {
           const text = await readDebugLog(
@@ -2566,12 +2558,7 @@ class KusterInboxSettingTab extends PluginSettingTab {
             new Notice("Debug log is empty");
             return;
           }
-          const dir = await pluginDataDir(
-            this.plugin.app,
-            this.plugin.manifest.dir,
-          );
-          const logPath = `${dir}/debug.log`;
-          await this.plugin.app.workspace.openLinkText(logPath, "", false);
+          new LogViewerModal(this.plugin.app, "Debug log", text).open();
         }),
       )
       .addButton((b) =>
@@ -2636,6 +2623,55 @@ class KusterInboxSettingTab extends PluginSettingTab {
 }
 
 // ============================================================================
+// Log viewer modal
+// ============================================================================
+
+// The failure log + debug log live at OS-absolute paths outside the vault.
+// Obsidian's `workspace.openLinkText` rejects those with "filenames can't
+// contain any of the following chars..." because the path has a Windows
+// drive letter / colon. Showing the contents in an in-Obsidian modal keeps
+// the user in the app and gives them a Copy button for bug reports.
+class LogViewerModal extends Modal {
+  private title: string;
+  private content: string;
+
+  constructor(app: App, title: string, content: string) {
+    super(app);
+    this.title = title;
+    this.content = content;
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: this.title });
+    const pre = contentEl.createEl("pre");
+    pre.style.cssText =
+      "max-height: 60vh; overflow: auto; font-size: 12px; line-height: 1.4; " +
+      "white-space: pre-wrap; word-break: break-word; padding: 8px; " +
+      "background: var(--background-secondary); border-radius: 4px;";
+    pre.textContent = this.content || "(empty)";
+    const buttons = contentEl.createDiv({
+      attr: { style: "display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px;" },
+    });
+    buttons.createEl("button", { text: "Close" }).addEventListener("click", () => this.close());
+    const copyBtn = buttons.createEl("button", { text: "Copy to clipboard" });
+    copyBtn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(this.content);
+        new Notice("Log copied to clipboard");
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        new Notice(`Could not copy: ${msg}`, 5000);
+      }
+    });
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
 // Duplicate-resolution modal
 // ============================================================================
 
