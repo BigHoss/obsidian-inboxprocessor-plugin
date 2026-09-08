@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.6.10](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.9...v0.6.10) (2026-09-08)
+
+
+### Bug Fixes
+
+* processInbox surfaces non-URL lines in Notice (no more silent no-ops) ([9dca5d8](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/9dca5d8b17f75c9e233d5c807b7351b53acdb6c9))
+
 ### [0.6.9](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.8...v0.6.9) (2026-09-08)
 
 
