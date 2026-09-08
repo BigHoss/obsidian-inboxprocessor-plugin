@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.6.8](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.7...v0.6.8) (2026-09-08)
+
+
+### Bug Fixes
+
+* use Node fs in pluginDataDir mkdir, surface silent log failures ([b8f058e](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/b8f058e48478207edebf562768733a54a1f1fbdf))
+
 ### [0.6.7](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.6...v0.6.7) (2026-09-06)
 
 ### [0.6.6](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.5...v0.6.6) (2026-09-02)
