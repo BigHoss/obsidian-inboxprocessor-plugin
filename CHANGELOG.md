@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.6.9](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.8...v0.6.9) (2026-09-08)
+
+
+### Bug Fixes
+
+* view-log buttons open in modal instead of using openLinkText ([b20445f](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/b20445fb1aad56bd9c2f8d58c58700ff800e5239))
+
 ### [0.6.8](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.7...v0.6.8) (2026-09-08)
 
 
