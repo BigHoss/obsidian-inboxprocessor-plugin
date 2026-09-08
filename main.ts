@@ -952,6 +952,10 @@ export default class KusterInboxPlugin extends Plugin {
 
   async processInbox(opts?: { silent?: boolean }): Promise<void> {
     const silent = opts?.silent === true;
+    this.pluginLog(
+      "INFO",
+      `processInbox invoked: inboxFile=${this.settings.inboxFile ?? "(undefined)"}, shareMarker="${(this.settings.shareMarker ?? "").slice(0, 40)}", silent=${silent}`,
+    );
     const file = this.resolveFile(this.settings.inboxFile);
     if (!file) {
       new Notice(`Inbox file not found: ${this.settings.inboxFile}`);
@@ -1259,6 +1263,10 @@ export default class KusterInboxPlugin extends Plugin {
   // show the modal, then spawn init-project.py. On success, open the new
   // project's index note.
   private async createProjectFromSelection(selection: string): Promise<void> {
+    this.pluginLog(
+      "INFO",
+      `createProjectFromSelection invoked: selectionLength=${selection.length}, projectsRoot=${this.settings.projectsRoot ?? "(undefined)"}, templateScriptPath=${this.settings.templateScriptPath ?? "(undefined)"}`,
+    );
     const types = await this.listProjectTypes();
     if (types.length === 0) {
       new Notice(
@@ -3085,7 +3093,15 @@ async function pluginDataDir(app: App, manifestDir: string): Promise<string> {
     const xdg = process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), ".config");
     base = `${xdg}/Link Inbox Processor`;
   }
-  await app.vault.adapter.mkdir(base).catch(() => undefined);
+  // Use Node fs directly — vault.adapter.mkdir silently fails for absolute
+  // paths outside the vault, leaving the dir non-existent and every
+  // subsequent log write to throw ENOENT. Node fs handles absolute paths
+  // reliably in the renderer.
+  const fs = require("fs/promises") as typeof import("fs/promises");
+  await fs.mkdir(base, { recursive: true }).catch((e: unknown) => {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(`Link Inbox Processor: could not create app-data dir "${base}": ${msg}`);
+  });
   return base;
 }
 
@@ -3181,8 +3197,11 @@ async function appendDebugLog(
         `${new Date().toISOString()} | debug-log | ${msg.replace(/\n/g, " ").trim()}\n`,
         "utf8",
       );
-    } catch {
-      // If even the failure log write fails, fall back to console only.
+    } catch (e2) {
+      // If even the failure log write fails, fall back to console only —
+      // but at least log it so the user knows logging itself is broken.
+      const msg2 = e2 instanceof Error ? e2.message : String(e2);
+      console.error("Link Inbox Processor: failure log write also failed", msg2);
     }
   }
 }
