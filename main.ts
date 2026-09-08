@@ -1005,6 +1005,8 @@ export default class KusterInboxPlugin extends Plugin {
     let okCount = 0;
     let skipCount = 0;
     let failCount = 0;
+    let unparseableCount = 0;
+    let firstUnparseable = "";
     let aborted = false;
     const cap = Math.min(lines.length, this.settings.maxLinksPerRun);
 
@@ -1016,6 +1018,8 @@ export default class KusterInboxPlugin extends Plugin {
           "DEBUG",
           `processInbox skip unparseable line ${i + 1}/${cap}: ${line.slice(0, 80)}`,
         );
+        if (firstUnparseable === "") firstUnparseable = line.slice(0, 60);
+        unparseableCount++;
         survivors.push(line);
         continue;
       }
@@ -1067,14 +1071,26 @@ export default class KusterInboxPlugin extends Plugin {
     this.lastRunAt = Date.now();
     this.pluginLog(
       "INFO",
-      `processInbox done: ok=${okCount}, skipped=${skipCount}, failed=${failCount}, deferred=${aborted ? 0 : Math.max(0, lines.length - cap)}, aborted=${aborted}`,
+      `processInbox done: ok=${okCount}, skipped=${skipCount}, failed=${failCount}, unparseable=${unparseableCount}, deferred=${aborted ? 0 : Math.max(0, lines.length - cap)}, aborted=${aborted}`,
     );
-    if (!silent) {
-      new Notice(
-        `Inbox: ${okCount} processed, ${skipCount} skipped, ${failCount} kept for retry${
-          cap < lines.length && !aborted ? `, ${lines.length - cap} deferred` : ""
-        }${aborted ? " (aborted)" : ""}`,
-      );
+    // Surface a Notice whenever there was anything to report. `silent` is
+    // meant to suppress the happy-path summary (cron-style usage) but
+    // never to hide the case where the inbox had content we couldn't
+    // process - that would leave the user wondering why nothing
+    // happened. The diagnostic always wins when there's a non-URL line.
+    if (!silent || unparseableCount > 0) {
+      const parts: string[] = [
+        `${okCount} processed`,
+        `${skipCount} skipped`,
+        `${failCount} kept for retry`,
+      ];
+      if (cap < lines.length && !aborted) parts.push(`${lines.length - cap} deferred`);
+      if (aborted) parts.push("aborted");
+      if (unparseableCount > 0) {
+        const trail = firstUnparseable.length >= 60 ? "..." : "";
+        parts.push(`${unparseableCount} non-URL (e.g. "${firstUnparseable}${trail}")`);
+      }
+      new Notice(`Inbox: ${parts.join(", ")}`);
     }
     this.refreshStatusBar();
   }
