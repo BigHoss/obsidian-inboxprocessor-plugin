@@ -1252,7 +1252,8 @@ export default class KusterInboxPlugin extends Plugin {
     const adapter = this.app.vault.adapter;
     const root = this.settings.projectsRoot.replace(/\/+$/, "");
     if (!(await adapter.exists(root))) return [];
-    const listing = await adapter.list(root);
+    const rawListing = await adapter.list(root);
+    const listing = Array.isArray(rawListing) ? rawListing : [];
     const subsAll = await Promise.all(
       listing.map(async (p) => {
         const isDir =
@@ -1638,13 +1639,15 @@ async function scanProjectsAgainstTemplate(
   const sep = basePath.includes("\\") ? "\\" : "/";
   const root = settings.projectsRoot.replace(/[/\\]+$/, "");
   if (!(await app.vault.adapter.exists(root))) return [];
-  const listing = await app.vault.adapter.list(root);
+  const rawListing = await app.vault.adapter.list(root);
+  const listing = Array.isArray(rawListing) ? rawListing : [];
   const misaligned: ProjectMisalignment[] = [];
   for (const dirEntry of listing) {
     if (await app.vault.adapter.exists(dirEntry.path) === false) continue;
     // dirEntry.path is the project-type subfolder (e.g. "1. Projects/3. Coding")
     const typeName = dirEntry.name;
-    const subListing = await app.vault.adapter.list(dirEntry.path);
+    const rawSub = await app.vault.adapter.list(dirEntry.path);
+    const subListing = Array.isArray(rawSub) ? rawSub : [];
     for (const projEntry of subListing) {
       const projName = projEntry.name;
       if (await app.vault.adapter.exists(projEntry.path) === false) continue;
