@@ -199,15 +199,20 @@ function isDestinationAllowed(
 // Line parsing
 // ============================================================================
 
-const RE_MD_LINK = /^\s*\[([^\]]+)\]\((https?:\/\/[^)]+)\)\s*$/;
-const RE_BARE_URL = /^(?:https?:\/\/)?(?:[\w-]+\.)+[\w-]+(?:\/[^\s)]*)?/i;
+const RE_MD_LINK = /^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/;
+const RE_BARE_URL = /(?:https?:\/\/)?(?:[\w-]+\.)+[\w-]+(?:\/[^\s]*)?/i;
 
 function parseLine(line: string): ParsedLine | null {
-  const md = line.match(RE_MD_LINK);
+  // Strip leading checkbox: "- [ ]", "- [x]", "[ ]", with flexible spacing.
+  // Exposes the URL/link body so the real regexes can match.
+  const stripped = line.replace(/^\s*(?:-\s+)?\[[ xX]\]\s*/, "").trim();
+  if (!stripped) return null;
+
+  const md = stripped.match(RE_MD_LINK);
   if (md) {
     return { title: md[1].trim(), url: md[2].trim(), raw: line };
   }
-  const bare = line.match(RE_BARE_URL);
+  const bare = stripped.match(RE_BARE_URL);
   if (bare) {
     let url = bare[0];
     if (!/^https?:\/\//i.test(url)) {
