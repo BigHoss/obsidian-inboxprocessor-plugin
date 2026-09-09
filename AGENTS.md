@@ -4,7 +4,15 @@
 
 Obsidian plugin that processes iOS-shared links from `0. Inbox/0. Inbox.md`
 into templated notes (per the iOS Share Target on Raphael's vault dashboard).
-TypeScript, bundled with esbuild, distributed via BRAT. Current version: 0.6.6.
+TypeScript, bundled with esbuild, distributed via BRAT. Current version: 0.6.11.
+
+## Vault interaction — use the CLI, not grep
+
+For vault reads/writes/searches/tasks/properties, load the `obs-kuster-cli`
+skill (`~/.config/opencode/skills/obs-kuster-cli`) and call
+`obsidian vault=Kuster.live <cmd>`. Don't grep the vault — the CLI parses
+`#task/pending` tags, scopes by path, and survives Windows argv traps.
+Raphael flagged this twice (2026-07-23): reach for the CLI first.
 
 ## Docs live in the vault, not in this repo
 
