@@ -445,6 +445,128 @@ async function enrichWithLlm(
 }
 
 // ============================================================================
+// Second-pass LLM fill: given a chosen template's body + URL, ask the LLM to
+// fill template-specific placeholders ({{X}} markers, frontmatter fields)
+// that the first classify pass didn't already populate.
+//
+// The catalogue-only first pass can't know about `{{rating}}` / `{{director}}`
+// / `{{due}}` and other template-specific fields — the LLM only sees the
+// linkType hints. This pass shows the LLM the actual template body so it
+// can fill everything in one shot, replacing the need for a separate
+// reprocessor round-trip.
+// ============================================================================
+
+function extractPlaceholders(template: string): string[] {
+  // Find every {{name}} marker. Skip the system ones renderNote + spliceFields
+  // handle locally (date:* + title). The rest are user/template fields the
+  // LLM might know how to fill from the URL.
+  const all = Array.from(template.matchAll(/\{\{([A-Za-z0-9_]+)(?::[^}]*)?\}\}/g));
+  const out = new Set<string>();
+  for (const m of all) {
+    const name = m[1];
+    if (name === "title") continue;
+    if (name === "date") continue;
+    out.add(name);
+  }
+  return Array.from(out);
+}
+
+async function enrichWithLlmTemplateFill(
+  app: App,
+  settings: KusterInboxSettings,
+  url: string,
+  templateBody: string,
+  unfilledPlaceholders: string[],
+): Promise<Record<string, string>> {
+  if (!settings.llmEnabled || !settings.openrouterApiKey) return {};
+  if (unfilledPlaceholders.length === 0) return {};
+
+  const claudeContext = await readClaudeContext(app, settings.claudeContextPath);
+
+  const systemPrompt =
+    `You are filling template placeholders for an Obsidian PARA-vault note about a URL. ` +
+    `Use your web-fetch / browser tool to read the URL itself; if you don't have one, infer ` +
+    `from the URL's domain and path alone.\n\n` +
+    `Template to fill (verbatim — preserve all formatting outside the listed placeholders):\n` +
+    `\`\`\`\n${templateBody}\n\`\`\`\n\n` +
+    `Placeholders to fill (return a JSON object mapping each name below to its value):\n` +
+    unfilledPlaceholders.map((p) => `- "${p}"`).join("\n") +
+    `\n\n` +
+    (claudeContext
+      ? `## User's classification context (from 0. Inbox/CLAUDE.md)\n\n${claudeContext}\n\n`
+      : "") +
+    `Return ONLY a JSON object. If you cannot reasonably determine a value for a placeholder, ` +
+    `return an empty string for it. Example: ` +
+    `\`{"rating": "4/5", "year": "2014", "director": "Wes Anderson"}\`. ` +
+    `No prose, no code fences.`;
+
+  const userPrompt = `URL: ${url}`;
+
+  try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${settings.openrouterApiKey}`,
+    };
+    if (settings.openrouterReferer) headers["HTTP-Referer"] = settings.openrouterReferer;
+    if (settings.openrouterAppName) headers["X-Title"] = settings.openrouterAppName;
+
+    appendDebugLog(
+      app,
+      ".obsidian/plugins/kuster-inbox-processor",
+      "DEBUG",
+      `enrichWithLlmTemplateFill request: url=${url}, placeholders=${unfilledPlaceholders.join(",")}`,
+      settings.debugEnabled,
+    );
+
+    const r = await requestUrl({
+      url: "https://openrouter.ai/api/v1/chat/completions",
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: settings.openrouterModel,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        temperature: 0.2,
+      }),
+      throw: false,
+    });
+
+    appendDebugLog(
+      app,
+      ".obsidian/plugins/kuster-inbox-processor",
+      "DEBUG",
+      `enrichWithLlmTemplateFill response: status=${r.status}, body=${(r.text ?? "").slice(0, 200)}`,
+      settings.debugEnabled,
+    );
+
+    if (r.status < 200 || r.status >= 300) return {};
+    const reply = r.json?.choices?.[0]?.message?.content ?? "";
+    const json = reply.match(/\{[\s\S]*\}/)?.[0];
+    if (!json) return {};
+    const parsed = JSON.parse(json);
+    const out: Record<string, string> = {};
+    for (const ph of unfilledPlaceholders) {
+      const v = parsed[ph];
+      if (typeof v === "string" && v.trim().length > 0) {
+        out[ph] = v.trim();
+      }
+    }
+    return out;
+  } catch (e) {
+    appendDebugLog(
+      app,
+      ".obsidian/plugins/kuster-inbox-processor",
+      "ERROR",
+      `enrichWithLlmTemplateFill failed: url=${url} — ${e instanceof Error ? e.message : String(e)}`,
+      settings.debugEnabled,
+    );
+    return {};
+  }
+}
+
+// ============================================================================
 // Render note from template
 // ============================================================================
 
@@ -455,6 +577,7 @@ function renderNote(
   llm: LlmEnrichment | null,
   stamp: string,
   destination: string,
+  placeholderFills: Record<string, string> = {},
 ): string {
   const finalTitle = llm?.refinedTitle ?? title ?? "Untitled Link";
   const tags = llm?.suggestedTags ?? [];
@@ -478,6 +601,14 @@ function renderNote(
     .replace(/\{\{date:YYYY-MM-DDTHH:mm\}\}/g, isoLike)
     .replace(/\{\{date:YYYY-MM-DD\}\}/g, dateOnly)
     .replace(/\{\{title\}\}/g, finalTitle);
+
+  // Fill template-specific placeholders returned by enrichWithLlmTemplateFill.
+  // These come AFTER the date+title sweep so a template author can't shadow
+  // built-ins by giving their placeholder the same name.
+  for (const [name, value] of Object.entries(placeholderFills)) {
+    if (name === "title" || name === "date") continue; // safety: never override
+    out = out.replaceAll(`{{${name}}}`, value);
+  }
 
   // Fill in blank `destination:`, `url:`, and `tags: []` lines if the
   // template uses them. Otherwise prepend a small metadata block.
@@ -1174,8 +1305,38 @@ export default class KusterInboxPlugin extends Plugin {
     const filename = `${stamp} - ${finalTitle || "Untitled Link"}.md`;
     const notePath = `${destinationDir}/${filename}`;
 
+    // 3.5 Second-pass LLM fill: hand the LLM the chosen template so it can
+    // populate template-specific placeholders ({{rating}}, {{year}}, etc.)
+    // that the catalogue-only classify pass doesn't know about. Skips when
+    // the template has no extra placeholders, when LLM is off, or when the
+    // API key is missing — in those cases notes render as before.
+    const templatePlaceholders = extractPlaceholders(template);
+    let placeholderFills: Record<string, string> = {};
+    if (
+      templatePlaceholders.length > 0 &&
+      this.settings.llmEnabled &&
+      this.settings.openrouterApiKey
+    ) {
+      onProgress?.(`Filling template fields via LLM…`);
+      placeholderFills = await enrichWithLlmTemplateFill(
+        this.app,
+        this.settings,
+        parsed.url,
+        template,
+        templatePlaceholders,
+      );
+    }
+
     // 4. Render
-    const body = renderNote(template, baseTitle, parsed.url, llm, stamp, destinationDir);
+    const body = renderNote(
+      template,
+      baseTitle,
+      parsed.url,
+      llm,
+      stamp,
+      destinationDir,
+      placeholderFills,
+    );
 
     // 5. Resolve filename collisions against existing files. Obsidian's
     // vault.create throws "File already exists" if the path is taken; we
@@ -1843,16 +2004,22 @@ async function reprocessInboxSubdirs(
       if (abs instanceof TFile) mdFiles.push(abs);
     }
 
-    // Determine required fields for this type from the configured template
+// Determine required fields for this type from the configured template
     const templatePath = Array.isArray(settings.templates) && settings.templates.length > 0
       ? settings.templates.find((t) => t.linkType === ttype)?.templatePath
       : null;
     if (!templatePath) continue;
     const requiredFields = await readTemplateRequiredFields(app, templatePath);
     if (requiredFields.length === 0) continue;
+    // Load the template body once per subdir so the LLM fill pass has the
+    // same context as during creation. Without this, the reprocessor was
+    // guessing field semantics from field names alone.
+    const templateBodyFile = app.vault.getAbstractFileByPath(templatePath);
+    const templateBody =
+      templateBodyFile instanceof TFile ? await app.vault.cachedRead(templateBodyFile) : "";
 
     for (const file of mdFiles) {
-      await processOneFile(app, file, ttype, requiredFields, settings, onProgress, result);
+      await processOneFile(app, file, ttype, requiredFields, settings, templateBody, onProgress, result);
     }
   }
   return result;
@@ -1864,6 +2031,7 @@ async function processOneFile(
   ttype: string,
   requiredFields: string[],
   settings: KusterInboxSettings,
+  templateBody: string,
   onProgress: ((msg: string) => void) | undefined,
   result: ReprocessResult,
 ): Promise<void> {
@@ -1886,7 +2054,7 @@ async function processOneFile(
   // a Link note), we trash the file rather than half-fill it.
   let filled: Record<string, string> = {};
   if (settings.llmEnabled && settings.openrouterApiKey) {
-    filled = await tryFillFieldsViaLlm(app, settings, file, ttype, emptyFields);
+    filled = await tryFillFieldsViaLlm(app, settings, file, ttype, emptyFields, templateBody);
   }
 
   // Verify all the originally-empty fields are now filled. Anything still
@@ -1969,14 +2137,21 @@ async function tryFillFieldsViaLlm(
   file: TFile,
   ttype: string,
   fields: string[],
+  templateBody: string,
 ): Promise<Record<string, string>> {
   // Use the existing enrichWithLlm-style call, but ask for ONLY the
-  // missing fields. We piggyback on the same OpenRouter endpoint.
+  // missing fields. The template body is now sent too so the LLM has
+  // the same context as during the creation pass — without this the
+  // reprocessor was guessing field semantics from field names alone.
   const systemPrompt =
-    `You classify a ${ttype} note from an Obsidian PARA vault. ` +
+    `You classify a ${ttype} note from an Obsidian PARA vault.\n\n` +
+    (templateBody
+      ? `Template the note was generated from (verbatim, for context on what each field means):\n` +
+        `\`\`\`\n${templateBody}\n\`\`\`\n\n`
+      : "") +
     `For each field name below, return the value that should fill it. ` +
-    `If you genuinely cannot determine the value (e.g. the URL is not ` +
-    `in the file body), return an empty string for that field. ` +
+    `Use your web-fetch / browser tool to read the URL if needed (it's in the file body). ` +
+    `If you genuinely cannot determine a value, return an empty string for that field. ` +
     `Return ONLY a JSON object like {"field1": "value1", "field2": "value2"}. ` +
     `Fields: ${fields.join(", ")}.`;
 
