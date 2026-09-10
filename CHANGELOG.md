@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.6.15](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.14...v0.6.15) (2026-09-10)
+
+
+### Bug Fixes
+
+* normalize app.vault.adapter.list() response shape ([7f3bb22](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/7f3bb2284efc2cadaee056712323ff9109a5f299))
+
 ### [0.6.14](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.13...v0.6.14) (2026-09-10)
 
 
