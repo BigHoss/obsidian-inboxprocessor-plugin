@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.6.16](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.15...v0.6.16) (2026-09-10)
+
+
+### Features
+
+* log reprocess + project-scan to debug.log ([e840bdd](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/e840bdd7af666f855142c9dacb14d291f1827021))
+
+
+### Bug Fixes
+
+* never trash notes — leave them for manual review when LLM can't fill ([4b56d73](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/4b56d73c2b233780267e20e9ddc55e34f9f2fc1d))
+
 ### [0.6.15](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.14...v0.6.15) (2026-09-10)
 
 
