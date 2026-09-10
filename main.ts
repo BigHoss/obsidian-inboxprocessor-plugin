@@ -118,7 +118,13 @@ const DEFAULT_SETTINGS: KusterInboxSettings = {
   ],
   defaultTemplatePath: "5. System/Templates/Inbox/Link Template.md",
   openrouterApiKey: "",
-  openrouterModel: "openrouter/auto-beta",
+  // Default: google/gemini-2.5-flash. Benchmark across 8 books × 14 models
+  // (Sept 2026): tied for top score (6/8 author-exact) with gpt-4o and gpt-5,
+  // ~5× cheaper ($0.00017 vs $0.00085 per call), ~2× faster (700ms vs 1500ms).
+  // All 4 Anthropic Claude IDs (claude-3.5/3.7/sonnet-4/etc.) and Grok returned
+  // 404 on this user's OpenRouter key at the time of writing — they're listed
+  // as alternates in the settings UI.
+  openrouterModel: "google/gemini-2.5-flash",
   openrouterReferer: "https://github.com/BigHoss/obsidian-inboxprocessor-plugin",
   openrouterAppName: "Link Inbox Processor",
   llmEnabled: false,
