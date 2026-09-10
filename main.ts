@@ -445,6 +445,49 @@ async function enrichWithLlm(
 }
 
 // ============================================================================
+// adapter.list() returns `{ files: string[], folders: string[] }` per the
+// DataAdapter API. Some Obsidian versions / layers return
+// `TAbstractFile[]` instead. Normalize both shapes into a uniform array of
+// `{ name, path }` entries so the rest of the code can iterate uniformly.
+// Without this, every `for (const x of await adapter.list(...))` site
+// silently sees an empty array (Array.isArray returns false for objects),
+// and the reprocessor / project scanner walk zero files.
+// ============================================================================
+
+function basenameOf(path: string): string {
+  const idx = path.lastIndexOf("/");
+  return idx >= 0 ? path.slice(idx + 1) : path;
+}
+
+function normalizeAdapterListing(
+  raw: unknown,
+): { name: string; path: string }[] {
+  if (Array.isArray(raw)) {
+    return raw as { name: string; path: string }[];
+  }
+  if (raw && typeof raw === "object") {
+    const obj = raw as { files?: unknown; folders?: unknown };
+    const out: { name: string; path: string }[] = [];
+    if (Array.isArray(obj.files)) {
+      for (const p of obj.files) {
+        if (typeof p === "string") {
+          out.push({ name: basenameOf(p), path: p });
+        }
+      }
+    }
+    if (Array.isArray(obj.folders)) {
+      for (const p of obj.folders) {
+        if (typeof p === "string") {
+          out.push({ name: basenameOf(p), path: p });
+        }
+      }
+    }
+    return out;
+  }
+  return [];
+}
+
+// ============================================================================
 // Second-pass LLM fill: given a chosen template's body + URL, ask the LLM to
 // fill template-specific placeholders ({{X}} markers, frontmatter fields)
 // that the first classify pass didn't already populate.
@@ -1413,8 +1456,7 @@ export default class KusterInboxPlugin extends Plugin {
     const adapter = this.app.vault.adapter;
     const root = this.settings.projectsRoot.replace(/\/+$/, "");
     if (!(await adapter.exists(root))) return [];
-    const rawListing = await adapter.list(root);
-    const listing = Array.isArray(rawListing) ? rawListing : [];
+    const listing = normalizeAdapterListing(await adapter.list(root));
     const subsAll = await Promise.all(
       listing.map(async (p) => {
         const isDir =
@@ -1800,15 +1842,15 @@ async function scanProjectsAgainstTemplate(
   const sep = basePath.includes("\\") ? "\\" : "/";
   const root = settings.projectsRoot.replace(/[/\\]+$/, "");
   if (!(await app.vault.adapter.exists(root))) return [];
-  const rawListing = await app.vault.adapter.list(root);
-  const listing = Array.isArray(rawListing) ? rawListing : [];
+  const listing = normalizeAdapterListing(await app.vault.adapter.list(root));
   const misaligned: ProjectMisalignment[] = [];
   for (const dirEntry of listing) {
     if (await app.vault.adapter.exists(dirEntry.path) === false) continue;
     // dirEntry.path is the project-type subfolder (e.g. "1. Projects/3. Coding")
     const typeName = dirEntry.name;
-    const rawSub = await app.vault.adapter.list(dirEntry.path);
-    const subListing = Array.isArray(rawSub) ? rawSub : [];
+    const subListing = normalizeAdapterListing(
+      await app.vault.adapter.list(dirEntry.path),
+    );
     for (const projEntry of subListing) {
       const projName = projEntry.name;
       if (await app.vault.adapter.exists(projEntry.path) === false) continue;
@@ -1986,13 +2028,14 @@ async function reprocessInboxSubdirs(
   for (const [subdir, ttype] of Object.entries(INBOX_SUBDIR_TYPES)) {
     const subdirPath = `${inboxRoot}/${subdir}`;
     if (!(await app.vault.adapter.exists(subdirPath))) continue;
-    // adapter.list() is documented to return TAbstractFile[] but can
-    // return undefined on corrupted vault state. The minified
-    // 'c is not iterable' bug from the v0.6.2 release was exactly
-    // that: `for (let g of c)` where c was the listing. Fall back
-    // to an empty array rather than crashing the whole command.
-    const rawListing = await app.vault.adapter.list(subdirPath);
-    const listing = Array.isArray(rawListing) ? rawListing : [];
+    // adapter.list() actually returns `{ files: string[], folders: string[] }`
+    // on this Obsidian version — not TAbstractFile[] as the comment below
+    // claims. normalizeAdapterListing handles both shapes; without it, the
+    // reprocessor walks zero files and reports "0 processed" even when the
+    // inbox subdirs are full. (See v0.6.14 fix that was missing.)
+    const listing = normalizeAdapterListing(
+      await app.vault.adapter.list(subdirPath),
+    );
     // adapter.list() returns TAbstractFile[]; we want only files whose
     // adapter.exists returns true (this filters out folders whose paths
     // appear in the listing). Async filter via map+reduce.
