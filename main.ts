@@ -2251,29 +2251,40 @@ async function tryFillFieldsViaLlm(
   fields: string[],
   templateBody: string,
 ): Promise<Record<string, string>> {
-  // Use the existing enrichWithLlm-style call, but ask for ONLY the
-  // missing fields. The template body is now sent too so the LLM has
-  // the same context as during the creation pass — without this the
-  // reprocessor was guessing field semantics from field names alone.
+  // Send the current note + template body, ask the LLM to fill the
+  // missing fields using its general knowledge of the title. The previous
+  // version of this prompt was overly conservative — it told the LLM to
+  // "use web-fetch to read the URL if it's in the file body" but for old
+  // notes the URL was lost, so the LLM returned empty values for things
+  // it actually knew (Big Fish → IMDB, Beef → 4.5/5, etc.).
+  //
+  // The new prompt explicitly authorizes general-knowledge fills and
+  // extracts the title from H1 to anchor the lookup.
+  const text = await app.vault.cachedRead(file);
+  const titleMatch = text.match(/^#\s+(.+)$/m);
+  const title = titleMatch ? titleMatch[1].trim() : "";
   const systemPrompt =
-    `You classify a ${ttype} note from an Obsidian PARA vault.\n\n` +
+    `You are filling metadata for an Obsidian PARA-vault ${ttype} note. ` +
+    `Use your general knowledge about the note's TITLE — you almost certainly know about popular movies, books, games, software tools, etc. ` +
+    `Only return empty if you've genuinely never heard of it.\n\n` +
     (templateBody
       ? `Template the note was generated from (verbatim, for context on what each field means):\n` +
         `\`\`\`\n${templateBody}\n\`\`\`\n\n`
       : "") +
-    `For each field name below, return the value that should fill it. ` +
-    `Use your web-fetch / browser tool to read the URL if needed (it's in the file body). ` +
-    `If you genuinely cannot determine a value, return an empty string for that field. ` +
-    `Return ONLY a JSON object like {"field1": "value1", "field2": "value2"}. ` +
-    `Fields: ${fields.join(", ")}.`;
+    `Return ONLY a JSON object mapping each required field name to its value. Examples:\n` +
+    `- {"rating": "4.5/5", "url": "https://...", "tags": ["movie", "drama"]}\n` +
+    `- {"destination": "1. Projects/Home Lab", "tags": ["homelab", "networking"]}\n\n` +
+    `For "rating", estimate from general critical consensus (Rotten Tomatoes / IMDb / Metacritic — match whatever scale your output implies, default "X/5"). ` +
+    `If a field genuinely cannot be filled (e.g., requires personal taste), return an empty string for that field.`;
 
-  const text = await app.vault.cachedRead(file);
-  const userPrompt = `File path: ${file.path}\n\nFile contents:\n${text}`;
+  const userPrompt = title
+    ? `Note title: "${title}". Note type: ${ttype}. Required fields: ${fields.join(", ")}.\n\nFile contents:\n${text}`
+    : `Note type: ${ttype}. Required fields: ${fields.join(", ")}.\n\nFile contents:\n${text}`;
 
   try {
     freeLog(
       app, settings, "DEBUG",
-      `tryFillFieldsViaLlm request: ${file.path} type=${ttype} fields=[${fields.join(",")}] model=${settings.openrouterModel}`,
+      `tryFillFieldsViaLlm request: ${file.path} type=${ttype} fields=[${fields.join(",")}] model=${settings.openrouterModel} title="${title}"`,
     );
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
@@ -2311,8 +2322,21 @@ async function tryFillFieldsViaLlm(
     const out: Record<string, string> = {};
     for (const field of fields) {
       const v = parsed[field];
+      // The LLM can return a string, an array (e.g. tags: ["a","b","c"]),
+      // or null. Empty strings, null, empty arrays, and non-string non-array
+      // values are treated as "couldn't fill" (file is left untouched).
+      let formatted: string | null = null;
       if (typeof v === "string" && v.trim().length > 0) {
-        out[field] = v.trim();
+        formatted = v.trim();
+      } else if (Array.isArray(v)) {
+        const items = v.filter((x) => typeof x === "string" && x.trim().length > 0).map((x) => x.trim());
+        if (items.length > 0) {
+          // Match the existing frontmatter inline-array style: `tags: [a, b, c]`
+          formatted = `[${items.join(", ")}]`;
+        }
+      }
+      if (formatted !== null) {
+        out[field] = formatted;
       }
     }
     freeLog(app, settings, "DEBUG", `tryFillFieldsViaLlm filled: ${file.path} fields=${JSON.stringify(out)}`);
