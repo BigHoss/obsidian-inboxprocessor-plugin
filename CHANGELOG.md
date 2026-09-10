@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.6.14](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.13...v0.6.14) (2026-09-10)
+
+
+### Features
+
+* two-pass LLM flow — send template body to AI for placeholder fill ([cb5e359](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/cb5e3599eb73bb2dc4a98dc2d7b5ef39d2ddd02e))
+
 ### [0.6.13](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.12...v0.6.13) (2026-09-09)
 
 
