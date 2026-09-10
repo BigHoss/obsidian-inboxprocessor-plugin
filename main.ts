@@ -885,7 +885,7 @@ export default class KusterInboxPlugin extends Plugin {
             this.app, this.settings, onProgress,
           );
           new Notice(
-            `Inbox reprocess done: ${result.processed} processed, ${result.skipped} already complete, ${result.failed} failed, ${result.trashed} trashed (missing irrecoverable fields).`,
+            `Inbox reprocess done: ${result.processed} filled, ${result.skipped} already complete, ${result.failed} failed, ${result.unfillable} left for manual review.`,
             12000,
           );
         } catch (e) {
@@ -970,7 +970,7 @@ export default class KusterInboxPlugin extends Plugin {
                 this.app, this.settings, onProgress,
               );
               new Notice(
-                `Reprocess: ${result.processed} processed, ${result.skipped} complete, ${result.failed} failed, ${result.trashed} trashed.`,
+                `Reprocess: ${result.processed} filled, ${result.skipped} complete, ${result.failed} failed, ${result.unfillable} left for review.`,
                 12000,
               );
             } catch (e) {
@@ -2003,7 +2003,7 @@ interface ReprocessResult {
   processed: number;       // successfully filled
   skipped: number;         // already had all required fields
   failed: number;          // LLM call or write failed
-  trashed: number;         // moved to .trash/ because unrecoverable
+  unfillable: number;      // LLM couldn't fill some required field; file left untouched
 }
 
 // Walk 0. Inbox/{Links,Tasks,Media,Research,Reference}/, check each .md
@@ -2013,7 +2013,7 @@ async function reprocessInboxSubdirs(
   settings: KusterInboxSettings,
   onProgress?: (msg: string) => void,
 ): Promise<ReprocessResult> {
-  const result: ReprocessResult = { processed: 0, skipped: 0, failed: 0, trashed: 0 };
+  const result: ReprocessResult = { processed: 0, skipped: 0, failed: 0, unfillable: 0 };
   // Early-return guard: without the LLM we can scan + report missing
   // fields, but we can't fill them. The original code had this as a
   // dead expression (`!t.llmEnabled||t.openrouterApiKey;`) that the
@@ -2093,20 +2093,23 @@ async function processOneFile(
     return;
   }
 
-  // Try the LLM. If it can't fill the value (e.g. URL truly missing for
-  // a Link note), we trash the file rather than half-fill it.
+  // Try the LLM. If it can't fill (e.g. URL not in body, OpenRouter error),
+  // we leave the file untouched. We NEVER trash — that was a v0.6.2 design
+  // decision that destroyed user data when fields couldn't be auto-filled.
+  // Per project policy: "when we delete something we just move it to the
+  // archive"; since the LLM can't decide intent, leaving the file in place
+  // is the right default. The user reviews it manually.
   let filled: Record<string, string> = {};
   if (settings.llmEnabled && settings.openrouterApiKey) {
     filled = await tryFillFieldsViaLlm(app, settings, file, ttype, emptyFields, templateBody);
   }
 
-  // Verify all the originally-empty fields are now filled. Anything still
-  // missing after the LLM call means we can't safely write this file —
-  // move to .trash/ for human triage.
+  // If the LLM left any required field empty, count it as unfillable and
+  // skip the file (do NOT touch it). This is intentionally non-destructive:
+  // the file keeps its original frontmatter so the user can fix it by hand.
   const stillEmpty = emptyFields.filter((f) => !filled[f] || filled[f].length === 0);
   if (stillEmpty.length > 0) {
-    await trashFile(app, file, stillEmpty);
-    result.trashed++;
+    result.unfillable++;
     return;
   }
 
@@ -2239,20 +2242,6 @@ async function tryFillFieldsViaLlm(
   } catch {
     return {};
   }
-}
-
-async function trashFile(app: App, file: TFile, missingFields: string[]): Promise<void> {
-  const trashDir = ".trash";
-  if (!(await app.vault.adapter.exists(trashDir))) {
-    await app.vault.adapter.mkdir(trashDir);
-  }
-  const ts = new Date().toISOString().replace(/[:.]/g, "-");
-  const baseName = file.basename;
-  const destPath = `${trashDir}/${ts}__${baseName}__missing-${missingFields.join(",")}.md`;
-  await app.vault.rename(file, destPath);
-  console.warn(
-    `Link Inbox Processor: trashed ${file.path} (missing: ${missingFields.join(", ")}) -> ${destPath}`,
-  );
 }
 
 // ============================================================================
