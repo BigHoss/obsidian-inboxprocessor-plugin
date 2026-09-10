@@ -2259,16 +2259,30 @@ async function processOneFile(
     filled = await tryFillFieldsViaLlm(app, settings, file, ttype, emptyFields, templateBody);
   }
 
-  // If the LLM left any required field empty, count it as unfillable and
-  // skip the file (do NOT touch it). This is intentionally non-destructive:
-  // the file keeps its original frontmatter so the user can fix it by hand.
+  // If the LLM left some required fields empty, we have two cases:
+  //   1. LLM returned NOTHING usable → file unchanged (unfillable, manual review)
+  //   2. LLM returned PARTIAL fills → write what we have, leave the rest empty
+  // Earlier we threw away partial fills just because one field (usually
+  // `rating`) was uncertain — losing the LLM's work on author/year/genre
+  // for that one missing rating. Better: preserve the partial fill.
   const stillEmpty = emptyFields.filter((f) => !filled[f] || filled[f].length === 0);
-  if (stillEmpty.length > 0) {
-    freeLog(app, settings, "INFO", `processOneFile unfillable: ${file.path} stillEmpty=[${stillEmpty.join(",")}] filled=${JSON.stringify(filled)}`);
+  const filledCount = Object.values(filled).filter((v) => v && v.length > 0).length;
+  if (filledCount === 0) {
+    freeLog(
+      app, settings, "INFO",
+      `processOneFile unfillable: ${file.path} LLM returned no fills stillEmpty=[${stillEmpty.join(",")}]`,
+    );
     result.unfillable++;
     return;
   }
-  freeLog(app, settings, "DEBUG", `processOneFile LLM filled all: ${file.path} filled=${JSON.stringify(filled)}`);
+  if (stillEmpty.length > 0) {
+    freeLog(
+      app, settings, "INFO",
+      `processOneFile partial fill: ${file.path} filled=[${Object.keys(filled).join(",")}] stillEmpty=[${stillEmpty.join(",")}]`,
+    );
+  } else {
+    freeLog(app, settings, "DEBUG", `processOneFile LLM filled all: ${file.path} filled=${JSON.stringify(filled)}`);
+  }
 
   // Splice filled values into the YAML, preserve the rest of the file.
   const newYaml = spliceFields(fm.yaml, filled);
