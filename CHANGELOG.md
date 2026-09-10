@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.6.17](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.16...v0.6.17) (2026-09-10)
+
+
+### Bug Fixes
+
+* isFieldEmptyInYaml regex matched wrong value (newline-eating \s*) ([7c5d23f](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/7c5d23fc55bf47cf4c4ff4272c2f619b6fdd052f))
+
 ### [0.6.16](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.15...v0.6.16) (2026-09-10)
 
 
