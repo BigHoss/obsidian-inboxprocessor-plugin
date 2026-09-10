@@ -610,6 +610,32 @@ async function enrichWithLlmTemplateFill(
 }
 
 // ============================================================================
+// Free-function debug logger
+// ============================================================================
+//
+// Most of the reprocessor / project-checker code paths live in free
+// functions — they can't reach `this.pluginLog` because they have no
+// `this`. Before this helper, every such call (reprocess, tryFillFieldsViaLlm,
+// scanProjectsAgainstTemplate, dryRunProjectScaffold, applyProjectFix)
+// was completely silent in debug.log. Use this helper from any free
+// function that wants to mirror to the debug log.
+// ============================================================================
+
+const PLUGIN_MANIFEST_DIR = ".obsidian/plugins/kuster-inbox-processor";
+
+function freeLog(
+  app: App,
+  settings: KusterInboxSettings,
+  level: DebugLevel,
+  msg: string,
+): void {
+  // Fire-and-forget; appendDebugLog swallows its own errors and no-ops
+  // when debugEnabled is false. We never want a debug line to break the
+  // user-facing operation.
+  void appendDebugLog(app, PLUGIN_MANIFEST_DIR, level, msg, settings.debugEnabled);
+}
+
+// ============================================================================
 // Render note from template
 // ============================================================================
 
@@ -1841,7 +1867,11 @@ async function scanProjectsAgainstTemplate(
   const basePath = app.vault.adapter.basePath.replace(/[/\\]+$/, "");
   const sep = basePath.includes("\\") ? "\\" : "/";
   const root = settings.projectsRoot.replace(/[/\\]+$/, "");
-  if (!(await app.vault.adapter.exists(root))) return [];
+  freeLog(app, settings, "INFO", `scanProjectsAgainstTemplate invoked: projectsRoot=${root}`);
+  if (!(await app.vault.adapter.exists(root))) {
+    freeLog(app, settings, "WARN", `scanProjectsAgainstTemplate bailing: ${root} does not exist`);
+    return [];
+  }
   const listing = normalizeAdapterListing(await app.vault.adapter.list(root));
   const misaligned: ProjectMisalignment[] = [];
   for (const dirEntry of listing) {
@@ -1851,6 +1881,7 @@ async function scanProjectsAgainstTemplate(
     const subListing = normalizeAdapterListing(
       await app.vault.adapter.list(dirEntry.path),
     );
+    freeLog(app, settings, "DEBUG", `scanProjects type=${typeName} projectCount=${subListing.length}`);
     for (const projEntry of subListing) {
       const projName = projEntry.name;
       if (await app.vault.adapter.exists(projEntry.path) === false) continue;
@@ -1858,10 +1889,12 @@ async function scanProjectsAgainstTemplate(
         basePath, sep, typeName, projName, projEntry.path,
       );
       if (result && result.missingFiles.length > 0) {
+        freeLog(app, settings, "INFO", `scanProjects misaligned: ${typeName}/${projName} missing=${result.missingFiles.length}`);
         misaligned.push(result);
       }
     }
   }
+  freeLog(app, settings, "INFO", `scanProjectsAgainstTemplate done: misaligned=${misaligned.length}`);
   return misaligned;
 }
 
@@ -2014,20 +2047,28 @@ async function reprocessInboxSubdirs(
   onProgress?: (msg: string) => void,
 ): Promise<ReprocessResult> {
   const result: ReprocessResult = { processed: 0, skipped: 0, failed: 0, unfillable: 0 };
+  freeLog(app, settings, "INFO", `reprocessInboxSubdirs invoked: llmEnabled=${settings.llmEnabled}, hasKey=${!!settings.openrouterApiKey}, inboxRoot=0. Inbox`);
   // Early-return guard: without the LLM we can scan + report missing
   // fields, but we can't fill them. The original code had this as a
   // dead expression (`!t.llmEnabled||t.openrouterApiKey;`) that the
   // minifier stripped, so the reprocess ran anyway and then trashed
   // every note because no fields could be filled. Catch it now.
   if (!settings.llmEnabled || !settings.openrouterApiKey) {
+    freeLog(app, settings, "WARN", `reprocessInboxSubdirs bailing: LLM disabled or API key missing`);
     return result;
   }
   const inboxRoot = "0. Inbox";
-  if (!(await app.vault.adapter.exists(inboxRoot))) return result;
+  if (!(await app.vault.adapter.exists(inboxRoot))) {
+    freeLog(app, settings, "WARN", `reprocessInboxSubdirs bailing: ${inboxRoot} does not exist`);
+    return result;
+  }
 
   for (const [subdir, ttype] of Object.entries(INBOX_SUBDIR_TYPES)) {
     const subdirPath = `${inboxRoot}/${subdir}`;
-    if (!(await app.vault.adapter.exists(subdirPath))) continue;
+    if (!(await app.vault.adapter.exists(subdirPath))) {
+      freeLog(app, settings, "DEBUG", `reprocess skip subdir: ${subdirPath} does not exist`);
+      continue;
+    }
     // adapter.list() actually returns `{ files: string[], folders: string[] }`
     // on this Obsidian version — not TAbstractFile[] as the comment below
     // claims. normalizeAdapterListing handles both shapes; without it, the
@@ -2047,24 +2088,32 @@ async function reprocessInboxSubdirs(
       if (abs instanceof TFile) mdFiles.push(abs);
     }
 
-// Determine required fields for this type from the configured template
+    // Determine required fields for this type from the configured template
     const templatePath = Array.isArray(settings.templates) && settings.templates.length > 0
       ? settings.templates.find((t) => t.linkType === ttype)?.templatePath
       : null;
-    if (!templatePath) continue;
+    if (!templatePath) {
+      freeLog(app, settings, "DEBUG", `reprocess skip subdir: ${subdir} no template configured for type=${ttype}`);
+      continue;
+    }
     const requiredFields = await readTemplateRequiredFields(app, templatePath);
-    if (requiredFields.length === 0) continue;
+    if (requiredFields.length === 0) {
+      freeLog(app, settings, "DEBUG", `reprocess skip subdir: ${subdir} template has 0 required fields`);
+      continue;
+    }
     // Load the template body once per subdir so the LLM fill pass has the
     // same context as during creation. Without this, the reprocessor was
     // guessing field semantics from field names alone.
     const templateBodyFile = app.vault.getAbstractFileByPath(templatePath);
     const templateBody =
       templateBodyFile instanceof TFile ? await app.vault.cachedRead(templateBodyFile) : "";
+    freeLog(app, settings, "INFO", `reprocess subdir: ${subdirPath} type=${ttype} requiredFields=[${requiredFields.join(",")}] mdCount=${mdFiles.length}`);
 
     for (const file of mdFiles) {
       await processOneFile(app, file, ttype, requiredFields, settings, templateBody, onProgress, result);
     }
   }
+  freeLog(app, settings, "INFO", `reprocessInboxSubdirs done: processed=${result.processed} skipped=${result.skipped} failed=${result.failed} unfillable=${result.unfillable}`);
   return result;
 }
 
@@ -2079,19 +2128,23 @@ async function processOneFile(
   result: ReprocessResult,
 ): Promise<void> {
   onProgress?.(`Reprocessing ${file.path}…`);
+  freeLog(app, settings, "DEBUG", `processOneFile start: ${file.path} type=${ttype} requiredFields=[${requiredFields.join(",")}]`);
   const text = await app.vault.cachedRead(file);
   const fm = parseFrontmatter(text);
   if (!fm) {
     // No frontmatter — skip; the template has required fields so this file
     // doesn't even match the template shape.
+    freeLog(app, settings, "DEBUG", `processOneFile skip (no frontmatter): ${file.path}`);
     result.skipped++;
     return;
   }
   const emptyFields = requiredFields.filter((f) => isFieldEmptyInYaml(fm.yaml, f));
   if (emptyFields.length === 0) {
+    freeLog(app, settings, "DEBUG", `processOneFile skip (already complete): ${file.path}`);
     result.skipped++;
     return;
   }
+  freeLog(app, settings, "DEBUG", `processOneFile needs fill: ${file.path} emptyFields=[${emptyFields.join(",")}]`);
 
   // Try the LLM. If it can't fill (e.g. URL not in body, OpenRouter error),
   // we leave the file untouched. We NEVER trash — that was a v0.6.2 design
@@ -2109,9 +2162,11 @@ async function processOneFile(
   // the file keeps its original frontmatter so the user can fix it by hand.
   const stillEmpty = emptyFields.filter((f) => !filled[f] || filled[f].length === 0);
   if (stillEmpty.length > 0) {
+    freeLog(app, settings, "INFO", `processOneFile unfillable: ${file.path} stillEmpty=[${stillEmpty.join(",")}] filled=${JSON.stringify(filled)}`);
     result.unfillable++;
     return;
   }
+  freeLog(app, settings, "DEBUG", `processOneFile LLM filled all: ${file.path} filled=${JSON.stringify(filled)}`);
 
   // Splice filled values into the YAML, preserve the rest of the file.
   const newYaml = spliceFields(fm.yaml, filled);
@@ -2125,11 +2180,11 @@ async function processOneFile(
   const newText = `---\n${renderedYaml}\n---\n${renderedBody}`;
   try {
     await app.vault.modify(file, newText);
+    freeLog(app, settings, "INFO", `processOneFile processed: ${file.path}`);
     result.processed++;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    // Free function — can't use this.pluginLog. console.error stays;
-    // debug log entries for free-function paths aren't supported yet.
+    freeLog(app, settings, "ERROR", `processOneFile failed to modify ${file.path}: ${msg}`);
     console.error(`Link Inbox Processor: failed to modify ${file.path}`, e);
     await appendFailureLog(app, { dir: ".obsidian/plugins/kuster-inbox-processor" }, file.path, msg);
     result.failed++;
@@ -2205,6 +2260,10 @@ async function tryFillFieldsViaLlm(
   const userPrompt = `File path: ${file.path}\n\nFile contents:\n${text}`;
 
   try {
+    freeLog(
+      app, settings, "DEBUG",
+      `tryFillFieldsViaLlm request: ${file.path} type=${ttype} fields=[${fields.join(",")}] model=${settings.openrouterModel}`,
+    );
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${settings.openrouterApiKey}`,
@@ -2226,10 +2285,17 @@ async function tryFillFieldsViaLlm(
       }),
       throw: false,
     });
+    freeLog(
+      app, settings, "DEBUG",
+      `tryFillFieldsViaLlm response: ${file.path} status=${r.status} bodyLen=${(r.text ?? "").length}`,
+    );
     if (r.status < 200 || r.status >= 300) return {};
     const reply = r.json?.choices?.[0]?.message?.content ?? "";
     const json = reply.match(/\{[\s\S]*\}/)?.[0];
-    if (!json) return {};
+    if (!json) {
+      freeLog(app, settings, "WARN", `tryFillFieldsViaLlm no JSON in reply for ${file.path} reply=${reply.slice(0, 200)}`);
+      return {};
+    }
     const parsed = JSON.parse(json);
     const out: Record<string, string> = {};
     for (const field of fields) {
@@ -2238,8 +2304,13 @@ async function tryFillFieldsViaLlm(
         out[field] = v.trim();
       }
     }
+    freeLog(app, settings, "DEBUG", `tryFillFieldsViaLlm filled: ${file.path} fields=${JSON.stringify(out)}`);
     return out;
-  } catch {
+  } catch (e) {
+    freeLog(
+      app, settings, "ERROR",
+      `tryFillFieldsViaLlm threw: ${file.path} err=${e instanceof Error ? e.message : String(e)}`,
+    );
     return {};
   }
 }
