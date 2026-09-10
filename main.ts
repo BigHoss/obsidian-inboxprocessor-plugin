@@ -923,6 +923,97 @@ export default class KusterInboxPlugin extends Plugin {
       },
     });
 
+    // Debug helper: run the reprocessor on a single note (active editor).
+    // Use this to iterate on prompt / template changes without reprocessing
+    // the whole inbox. Toggle Debug logging on in settings to see the full
+    // LLM prompt + reply in debug.log.
+    this.addCommand({
+      id: "reprocess-current-note",
+      name: "Reprocess current note manually (debug)",
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        return file instanceof TFile;
+      },
+      callback: async () => {
+        const file = this.app.workspace.getActiveFile();
+        if (!(file instanceof TFile)) {
+          new Notice("No active file to reprocess.");
+          return;
+        }
+        if (!this.settings.llmEnabled || !this.settings.openrouterApiKey) {
+          new Notice(
+            "Enable OpenRouter LLM enrichment in settings first.",
+            10000,
+          );
+          return;
+        }
+        // Determine linkType from folder path. Only the three configured
+        // inbox subdirs are supported (same as reprocessInboxSubdirs).
+        const path = file.path;
+        let ttype: string | null = null;
+        for (const [subdir, type] of Object.entries(INBOX_SUBDIR_TYPES)) {
+          if (path.startsWith(`0. Inbox/${subdir}/`)) {
+            ttype = type;
+            break;
+          }
+        }
+        if (!ttype) {
+          new Notice(
+            `${file.basename} is not in 0. Inbox/{Links,Tasks,Media}/ — can't reprocess.`,
+            8000,
+          );
+          return;
+        }
+        const slot = (this.settings.templates ?? []).find(
+          (t) => t.linkType === ttype,
+        );
+        if (!slot) {
+          new Notice(`No template configured for type=${ttype}.`, 8000);
+          return;
+        }
+        const tf = this.app.vault.getAbstractFileByPath(slot.templatePath);
+        if (!(tf instanceof TFile)) {
+          new Notice(`Template not found: ${slot.templatePath}`, 8000);
+          return;
+        }
+        const templateBody = await this.app.vault.cachedRead(tf);
+        const requiredFields = await readTemplateRequiredFields(
+          this.app, slot.templatePath,
+        );
+        if (requiredFields.length === 0) {
+          new Notice(
+            `Template ${slot.templatePath} has no empty required fields — nothing to fill.`,
+            8000,
+          );
+          return;
+        }
+        this.pluginLog(
+          "INFO",
+          `reprocess-current-note invoked: ${file.path} type=${ttype} requiredFields=[${requiredFields.join(",")}]`,
+        );
+        const result: ReprocessResult = {
+          processed: 0, skipped: 0, failed: 0, unfillable: 0,
+        };
+        await processOneFile(
+          this.app, file, ttype, requiredFields, this.settings,
+          templateBody, undefined, result,
+        );
+        const tag = result.processed > 0
+          ? "filled"
+          : result.skipped > 0
+          ? "already complete"
+          : result.unfillable > 0
+          ? "left for manual review"
+          : "no change";
+        new Notice(
+          `${file.basename}: ${tag} (processed=${result.processed} skipped=${result.skipped} failed=${result.failed} unfillable=${result.unfillable}). ` +
+          (result.unfillable > 0 ? "Check debug.log for the LLM response." : ""),
+          12000,
+        );
+        this.refreshStatusBar();
+      },
+    });
+
     this.addSettingTab(new KusterInboxSettingTab(this.app, this));
 
     // Status bar — pending count, with a right-click context menu
@@ -2286,6 +2377,22 @@ async function tryFillFieldsViaLlm(
       app, settings, "DEBUG",
       `tryFillFieldsViaLlm request: ${file.path} type=${ttype} fields=[${fields.join(",")}] model=${settings.openrouterModel} title="${title}"`,
     );
+    // Verbose dump when Debug logging is enabled — full prompt + reply in
+    // debug.log so you can iterate on the template/prompt without rerunning
+    // the whole inbox. Set Debug logging in settings, then run via the
+    // "Reprocess current note manually" command (only this LLM call dumps
+    // the full content — the bulk reprocessor logs summary lines to keep
+    // debug.log readable).
+    if (settings.debugEnabled) {
+      freeLog(
+        app, settings, "DEBUG",
+        `tryFillFieldsViaLlm FULL SYSTEM PROMPT for ${file.path} (${systemPrompt.length} chars):\n${systemPrompt}`,
+      );
+      freeLog(
+        app, settings, "DEBUG",
+        `tryFillFieldsViaLlm FULL USER PROMPT for ${file.path} (${userPrompt.length} chars):\n${userPrompt}`,
+      );
+    }
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${settings.openrouterApiKey}`,
@@ -2311,6 +2418,14 @@ async function tryFillFieldsViaLlm(
       app, settings, "DEBUG",
       `tryFillFieldsViaLlm response: ${file.path} status=${r.status} bodyLen=${(r.text ?? "").length}`,
     );
+    // Full reply dump when Debug logging is enabled.
+    if (settings.debugEnabled) {
+      const replyText = r.json?.choices?.[0]?.message?.content ?? "";
+      freeLog(
+        app, settings, "DEBUG",
+        `tryFillFieldsViaLlm FULL REPLY for ${file.path} (${replyText.length} chars):\n${replyText}`,
+      );
+    }
     if (r.status < 200 || r.status >= 300) return {};
     const reply = r.json?.choices?.[0]?.message?.content ?? "";
     const json = reply.match(/\{[\s\S]*\}/)?.[0];
