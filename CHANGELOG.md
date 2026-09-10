@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.6.18](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.17...v0.6.18) (2026-09-10)
+
+
+### Bug Fixes
+
+* reprocessor prompt now lets LLM fill from general knowledge ([167d4d3](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/167d4d3adcc7aae5a8dc0dbde4483ef3c232861f))
+
 ### [0.6.17](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.16...v0.6.17) (2026-09-10)
 
 
