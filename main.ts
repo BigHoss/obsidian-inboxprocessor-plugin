@@ -1711,15 +1711,21 @@ URL:
 // value) define the canonical set. New template = new required field, no
 // code change needed.
 function isFieldEmptyInYaml(yaml: string, fieldName: string): boolean {
-  // Match the field name at the start of a line (with optional whitespace),
-  // followed by `:` and an optional value. We treat the value as "empty" if
-  // it's blank, an empty string `""`, or an empty array `[]`.
+  // Match the field name at the start of a line (with optional horizontal
+  // whitespace), followed by `:` and an optional value. We treat the value
+  // as "empty" if it's blank, an empty string `""`, or an empty array `[]`.
   // Examples that are NOT empty: `priority: medium`, `category: tv-show`,
   //   `tags: [media]`, `created: 2026-09-01`.
   // Examples that ARE empty: `url:`, `destination:`, `priority:`,
   //   `tags: []`.
+  //
+  // CRITICAL: use `[ \t]*` (not `\s*`) after the colon. With the `m` flag,
+  // `\s` matches `\n` too, so `\s*` greedily ate the newline and `.*$`
+  // captured the NEXT line's value. For `rating:\ntags: [media]`, this
+  // matched `tags: [media]` as the value of `rating` and the reprocessor
+  // skipped every file as "already complete" instead of filling anything.
   const re = new RegExp(
-    `^${fieldName}\\s*:\\s*(.*)$`,
+    `^${fieldName}[ \\t]*:[ \\t]*(.*)$`,
     "m",
   );
   const m = yaml.match(re);
@@ -1736,7 +1742,12 @@ function isFieldEmptyInYaml(yaml: string, fieldName: string): boolean {
 function parseFrontmatter(
   text: string,
 ): { yaml: string; body: string } | null {
-  const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
+  // `m` flag allows frontmatter to live anywhere in the file (some notes
+  // have a leading HTML comment, a Templater invocation, or other
+  // preamble — e.g. Pelicot book.md has `<!-- needs-review: templater-render -->`
+  // above its frontmatter). Without `m`, the reprocessor skips any file
+  // whose frontmatter isn't at column 0 line 0.
+  const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/m);
   if (!m) return null;
   const yaml = m[1];
   const body = text.slice(m[0].length);
