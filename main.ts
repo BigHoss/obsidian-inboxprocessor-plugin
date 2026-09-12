@@ -1512,7 +1512,13 @@ export default class KusterInboxPlugin extends Plugin {
     if (resolution.kind === "abort") return { abort: true }; // stop the entire batch
     const resolvedPath = resolution.path;
 
-    // 7. Write atomically — vault.create auto-creates parent folders
+    // 7. Write atomically. Ensure the parent directory exists first —
+    // vault.create's "auto-create parents" behavior changed between
+    // Obsidian versions, so we mkdir explicitly to be safe (and quiet).
+    const parentDir = resolvedPath.split("/").slice(0, -1).join("/");
+    if (parentDir && !(await this.app.vault.adapter.exists(parentDir))) {
+      await this.app.vault.adapter.mkdir(parentDir);
+    }
     await this.app.vault.create(resolvedPath, body);
 
     return resolvedPath;
