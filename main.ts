@@ -27,6 +27,7 @@ import {
   RequestUrlParam,
   Setting,
   TFile,
+  TFolder,
 } from "obsidian";
 
 // In-process project template scaffolder. Replaces the Python
@@ -1990,6 +1991,11 @@ async function scanProjectsAgainstTemplate(
   const misaligned: ProjectMisalignment[] = [];
   for (const dirEntry of listing) {
     if (await app.vault.adapter.exists(dirEntry.path) === false) continue;
+    // Skip files — the projectsRoot can contain loose notes (e.g.
+    // "1. Projects.md", "().md") that the adapter returns alongside
+    // directories. We only want to recurse into TFolder instances.
+    const dirAbstract = app.vault.getAbstractFileByPath(dirEntry.path);
+    if (!(dirAbstract instanceof TFolder)) continue;
     // dirEntry.path is the project-type subfolder (e.g. "1. Projects/3. Coding")
     const typeName = dirEntry.name;
     const subListing = normalizeAdapterListing(
@@ -1998,7 +2004,8 @@ async function scanProjectsAgainstTemplate(
     freeLog(app, settings, "DEBUG", `scanProjects type=${typeName} projectCount=${subListing.length}`);
     for (const projEntry of subListing) {
       const projName = projEntry.name;
-      if (await app.vault.adapter.exists(projEntry.path) === false) continue;
+      const projAbstract = app.vault.getAbstractFileByPath(projEntry.path);
+      if (!(projAbstract instanceof TFolder)) continue;
       const result = await dryRunProjectScaffold(
         basePath, sep, typeName, projName, projEntry.path,
       );
