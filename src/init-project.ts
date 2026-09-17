@@ -465,7 +465,9 @@ function buildRenderContext(
   const created = opts.created ?? today;
   const vaultRoot = opts.vaultRoot ?? "";
   const projectRelpath =
-    opts.projectRelpath ?? path.basename(path.resolve(dstDir));
+    opts.projectRelpath ?? path.basename(
+      vaultRoot ? path.resolve(vaultRoot, dstDir) : path.resolve(dstDir),
+    );
   return {
     name: opts.name,
     key: opts.key,
@@ -475,7 +477,7 @@ function buildRenderContext(
     templateVersion,
     projectRelpath,
     vaultRoot,
-    dstAbs: path.resolve(dstDir),
+    dstAbs: vaultRoot ? path.resolve(vaultRoot, dstDir) : path.resolve(dstDir),
     repoPath: opts.repoPath ?? "",
     repoUrl: opts.repoUrl ?? "",
     stack: opts.stack ?? [],
@@ -684,8 +686,20 @@ async function run(
   dstDir: string,
   opts: ScaffoldOptions,
 ): Promise<ScaffoldAction[]> {
-  const templateDirAbs = path.resolve(templateDir);
-  const dstDirAbs = path.resolve(dstDir);
+  // CRITICAL: templateDir and dstDir are passed in as vault-RELATIVE paths
+  // (e.g. "5. System/Templates/Project Folder Template",
+  // "1. Projects/3. Coding/Homelab Manager"). Node's path.resolve() of a
+  // relative path resolves against process.cwd() — which for an Electron
+  // renderer is the Obsidian install directory (e.g. C:\Program Files\Obsidian).
+  // So a previous build was trying to mkdir inside the Obsidian install
+  // (EPERM on Windows). Always anchor to opts.vaultRoot when available.
+  const vaultRoot = opts.vaultRoot ?? "";
+  const templateDirAbs = vaultRoot
+    ? path.resolve(vaultRoot, templateDir)
+    : path.resolve(templateDir);
+  const dstDirAbs = vaultRoot
+    ? path.resolve(vaultRoot, dstDir)
+    : path.resolve(dstDir);
 
   if (looksLikeTraversal(dstDir)) {
     throw new Error(`init-project: destination contains '..' traversal: ${dstDir}`);

@@ -2103,9 +2103,36 @@ class ProjectCheckModal extends Modal {
       });
     }
 
-    const closeAllBtn = contentEl.createEl("button", { text: "Close" });
-    closeAllBtn.style.marginTop = "12px";
-    closeAllBtn.addEventListener("click", () => {
+    const summary = contentEl.createDiv();
+    summary.style.cssText = "margin-top: 12px; display: flex; gap: 6px; align-items: center;";
+
+    const applyAllBtn = summary.createEl("button", { text: "Apply all" });
+    applyAllBtn.addEventListener("click", async () => {
+      applyAllBtn.disabled = true;
+      applyAllBtn.setText("Applying…");
+      const fixed: string[] = [];
+      const failed: { name: string; error: string }[] = [];
+      // Disable every per-row fix button while we run.
+      const allFixButtons = list.querySelectorAll("button");
+      allFixButtons.forEach((b) => ((b as HTMLButtonElement).disabled = true));
+      for (let i = 0; i < this.misalignments.length; i++) {
+        const m = this.misalignments[i];
+        applyAllBtn.setText(`Applying ${i + 1}/${this.misalignments.length}: ${m.projectName}…`);
+        const result = await applyProjectFix(this.app, this.basePath, this.sep, m);
+        if (result.ok) fixed.push(m.projectPath);
+        else failed.push({ name: m.projectPath, error: result.error ?? "unknown" });
+      }
+      const okCount = fixed.length;
+      const failCount = failed.length;
+      const okPart = okCount > 0 ? `${okCount} applied` : "";
+      const failPart = failCount > 0 ? `${failCount} failed` : "";
+      const sep = okPart && failPart ? ", " : "";
+      applyAllBtn.setText(`Done — ${okPart}${sep}${failPart}`);
+      this.onDone({ fixed, skipped: [], failed });
+    });
+
+    const closeBtn = summary.createEl("button", { text: "Close" });
+    closeBtn.addEventListener("click", () => {
       this.close();
       this.onDone({ fixed: [], skipped: [], failed: [] });
     });
