@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.6.20](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.19...v0.6.20) (2026-09-17)
+
+
+### Bug Fixes
+
+* processOne explicitly creates parent dir before vault.create ([370482b](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/370482b8fe28936fff1ff9fb7d8943efb72c6eb5))
+* scanProjectsAgainstTemplate skips files (treats them as folders) ([fd0eb4b](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/fd0eb4ba4a0bcf42dd13805d7fa809457a9ed28a))
+
 ### [0.6.19](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.18...v0.6.19) (2026-09-10)
 
 
