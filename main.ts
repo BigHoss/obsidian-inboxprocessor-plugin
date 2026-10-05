@@ -1669,7 +1669,7 @@ export default class KusterInboxPlugin extends Plugin {
       await appendFailureLog(
         this.app,
         this.manifest,
-        "create-project-from-selection",
+        destDir,
         `scaffold failed: ${msg}`,
       );
       return;
@@ -3667,12 +3667,22 @@ async function appendFailureLog(
     const logPath = `${dir}/process-failures.log`;
     const ts = new Date().toISOString();
     const line = `${ts} | ${url} | ${errorMessage.replace(/\n/g, " ").trim()}\n`;
-    const existing = (await app.vault.adapter.exists(logPath))
-      ? await app.vault.adapter.read(logPath)
-      : "";
-    await app.vault.adapter.write(logPath, existing + line);
-  } catch {
-    // Don't let logging failures break the main flow.
+    // Use Node fs (not vault.adapter) — vault.adapter treats absolute paths
+    // as vault-relative and produces ENOENT for paths outside the vault.
+    const fs = require("fs/promises") as typeof import("fs/promises");
+    let existing = "";
+    try {
+      existing = await fs.readFile(logPath, "utf8");
+    } catch (e) {
+      const err = e as NodeJS.ErrnoException;
+      if (err.code !== "ENOENT") throw e;
+    }
+    await fs.appendFile(logPath, line, "utf8");
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // Don't let logging failures break the main flow, but at least make them
+    // visible in DevTools instead of silently disappearing.
+    console.error(`Link Inbox Processor: could not write failure log: ${msg}`);
   }
 }
 
