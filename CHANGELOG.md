@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.6.22](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.21...v0.6.22) (2026-10-05)
+
+
+### Bug Fixes
+
+* scaffold failure log now persists (vault.adapter wrote to vault-relative path; switch to Node fs) ([cf5e3f8](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/commit/cf5e3f810f04c51ae837df7c869f8d40ef15f97a))
+
 ### [0.6.21](https://github.com/BigHoss/obsidian-inboxprocessor-plugin/compare/v0.6.20...v0.6.21) (2026-10-05)
 
 
