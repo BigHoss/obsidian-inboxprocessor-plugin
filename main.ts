@@ -1589,9 +1589,12 @@ export default class KusterInboxPlugin extends Plugin {
     const listing = normalizeAdapterListing(await adapter.list(root));
     const subsAll = await Promise.all(
       listing.map(async (p) => {
+        // adapter.exists() returns true for both files and directories, so it
+        // can't distinguish them on its own. Verify via the vault's typed
+        // file map — same pattern scanProjectsAgainstTemplate uses.
         const isDir =
-          (p as { isDirectory?: boolean }).isDirectory === true ||
-          (await adapter.exists(p.path));
+          (await adapter.exists(p.path)) &&
+          this.app.vault.getAbstractFileByPath(p.path) instanceof TFolder;
         return { p, isDir };
       }),
     );
